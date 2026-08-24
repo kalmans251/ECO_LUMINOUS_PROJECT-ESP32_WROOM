@@ -1,0 +1,6 @@
+file(GLOB_RECURSE HELIX_SOURCES "*.c")
+
+idf_component_register(
+    SRCS ${HELIX_SOURCES}
+    INCLUDE_DIRS "." "utils"
+)
