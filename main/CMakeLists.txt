@@ -15,4 +15,5 @@ idf_component_register(
         esp_driver_i2s
         helix_mp3
         espressif__led_strip
+        codec2
 )
