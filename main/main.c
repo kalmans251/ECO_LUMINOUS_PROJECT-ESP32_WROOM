@@ -31,7 +31,6 @@
 #include "services/gap/ble_svc_gap.h"
 
 #define TAG "WROOM_BLE"
-static const char *TARGET_DEVICE_NAME = "ESP32S3_EMERGENCY_SYSTEM";
 
 #define I2S_BCLK_PIN        27
 #define I2S_LRCK_PIN        33
@@ -69,6 +68,7 @@ static struct CODEC2 *s_c2_dec = NULL;
 #define FILE_BUF_SIZE       (2 * 1024)
 #define PCM_BUF_SIZE        (1152 * 2 * sizeof(int16_t))
 
+// S3와 100% 매칭되는 128비트 리틀엔디언 UUID
 static const ble_uuid128_t S3_SVC_UUID = 
     BLE_UUID128_INIT(0x4b, 0x91, 0x31, 0xc3, 0xc9, 0xc5, 0xcc, 0x8f, 0x9e, 0x45, 0xb5, 0x1f, 0x01, 0xc2, 0xaf, 0x4f);
 static const ble_uuid128_t S3_CHAR_EMERGENCY_UUID = 
@@ -117,6 +117,7 @@ static bool s_subscription_started = false;
 static volatile uint32_t s_rx_r1_cnt = 0;
 static volatile uint32_t s_rx_r2_cnt = 0;
 static volatile uint32_t s_rx_em_cnt = 0;
+static volatile uint32_t s_rx_audio_cnt = 0;
 static volatile bool s_ble_connected = false;
 static uint32_t s_emergency_trigger_time = 0;
 
@@ -183,6 +184,7 @@ static void ble_subscribe_task(void *pvParameters) {
         ble_gattc_write_flat(conn, g_handle_audio + 1, enable, sizeof(enable), NULL, NULL);
         vTaskDelay(pdMS_TO_TICKS(80));
     }
+    ESP_LOGI(TAG, "🔔 [구독 완료] S3의 센서 및 오디오 데이터 실시간 수신 시작!");
     vTaskDelete(NULL);
 }
 
@@ -215,6 +217,7 @@ static int on_disc_svc(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 static int on_mtu_exchange(uint16_t conn_handle, const struct ble_gatt_error *error,
                            uint16_t mtu, void *arg) {
+    ESP_LOGI(TAG, "📦 MTU 크기 협상 완료 (%d Byte) -> 서비스 탐색", mtu);
     ble_gattc_disc_all_svcs(conn_handle, on_disc_svc, NULL);
     return 0;
 }
@@ -224,7 +227,12 @@ static void ble_client_scan(void) {
     if (ble_hs_id_infer_auto(0, &own_addr_type) != 0) return;
 
     struct ble_gap_disc_params disc_params = {
-        .filter_duplicates = 0, .passive = 0, .itvl = 0x0040, .window = 0x0030, .filter_policy = 0, .limited = 0
+        .filter_duplicates = 1,
+        .passive = 0,
+        .itvl = 0x0040,
+        .window = 0x0030,
+        .filter_policy = 0,
+        .limited = 0
     };
     ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
 }
@@ -235,17 +243,38 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
     case BLE_GAP_EVENT_DISC:
         if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) == 0) {
-            bool is_match = false;
-            for (int i = 0; i < fields.num_uuids128; i++) {
-                if (ble_uuid_cmp(&fields.uuids128[i].u, &S3_SVC_UUID.u) == 0) { is_match = true; break; }
+            char dev_name[33] = {0};
+            if (fields.name != NULL && fields.name_len > 0) {
+                memcpy(dev_name, fields.name, fields.name_len < 32 ? fields.name_len : 32);
             }
-            if (!is_match && fields.name != NULL && fields.name_len > 0) {
-                char dev_name[32] = {0};
-                memcpy(dev_name, fields.name, fields.name_len < 31 ? fields.name_len : 31);
-                if (strstr(dev_name, "ESP32S3") != NULL || strstr(dev_name, "EMERGENCY") != NULL) is_match = true;
+
+            // 주변에 감지되는 모든 장치 이름과 MAC 출력 (디버깅)
+            char addr_str[18];
+            snprintf(addr_str, sizeof(addr_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                     event->disc.addr.val[5], event->disc.addr.val[4], event->disc.addr.val[3],
+                     event->disc.addr.val[2], event->disc.addr.val[1], event->disc.addr.val[0]);
+
+            if (strlen(dev_name) > 0) {
+                ESP_LOGI(TAG, "📡 발견된 BLE 장치: [%s] | MAC: %s | RSSI: %d", dev_name, addr_str, event->disc.rssi);
+            }
+
+            bool is_match = false;
+            // 1. 서비스 UUID 128비트 매칭
+            for (int i = 0; i < fields.num_uuids128; i++) {
+                if (ble_uuid_cmp(&fields.uuids128[i].u, &S3_SVC_UUID.u) == 0) {
+                    is_match = true;
+                    break;
+                }
+            }
+            // 2. 디바이스 이름 매칭
+            if (!is_match && strlen(dev_name) > 0) {
+                if (strstr(dev_name, "ESP32S3") != NULL || strstr(dev_name, "EMERGENCY") != NULL || strstr(dev_name, "S3") != NULL) {
+                    is_match = true;
+                }
             }
 
             if (is_match) {
+                ESP_LOGW(TAG, "🎯 [S3 감지 완료!] 이름:[%s] MAC:%s -> 즉시 BLE 연결을 시도합니다!", dev_name, addr_str);
                 ble_gap_disc_cancel();
                 uint8_t own_addr_type;
                 ble_hs_id_infer_auto(0, &own_addr_type);
@@ -259,6 +288,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             g_conn_handle = event->connect.conn_handle;
             s_ble_connected = true;
             s_subscription_started = false;
+            ESP_LOGI(TAG, "🔗 S3 비상장치 BLE 연결 성공!");
             ble_gattc_exchange_mtu(g_conn_handle, on_mtu_exchange, NULL);
         } else {
             s_ble_connected = false;
@@ -272,6 +302,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         s_subscription_started = false;
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_handle_emergency = 0; g_handle_radar1 = 0; g_handle_radar2 = 0; g_handle_audio = 0;
+        ESP_LOGW(TAG, "⚡ S3 BLE 연결 해제됨 -> 재스캔 시작");
         ble_client_scan();
         break;
 
@@ -284,6 +315,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         if (attr_handle == g_handle_emergency) {
             char msg[32] = {0};
             memcpy(msg, rx_buf, pkt_len < sizeof(msg) ? pkt_len : sizeof(msg) - 1);
+            ESP_LOGW(TAG, "🚨 S3 비상/버튼 수신: [%s]", msg);
 
             if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 s_rx_em_cnt++;
@@ -308,6 +340,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             }
         }
         else if (attr_handle == g_handle_audio) {
+            s_rx_audio_cnt++;
             if (s_voice_call_mode && pkt_len > 0) {
                 uint8_t voice_pkt[64];
                 voice_pkt[0] = 0xA5; voice_pkt[1] = 0x5A; voice_pkt[2] = (uint8_t)pkt_len;
@@ -390,14 +423,14 @@ static void radar_process_task(void *pvParameters) {
         tx_frame[4] = (uint8_t)((snap.out_count >> 8) & 0xFF); tx_frame[5] = (uint8_t)(snap.out_count & 0xFF);
 
         for (int i = 0; i < 3; i++) {
-            tx_frame[6 + (i * 2)]  = (uint8_t)((snap.r1_x[i] >> 8) & 0xFF);
-            tx_frame[7 + (i * 2)]  = (uint8_t)(snap.r1_x[i] & 0xFF);
-            tx_frame[12 + (i * 2)] = (uint8_t)((snap.r1_y[i] >> 8) & 0xFF);
-            tx_frame[13 + (i * 2)] = (uint8_t)(snap.r1_y[i] & 0xFF);
-            tx_frame[18 + (i * 2)] = (uint8_t)((snap.r2_x[i] >> 8) & 0xFF);
-            tx_frame[19 + (i * 2)] = (uint8_t)(snap.r2_x[i] & 0xFF);
-            tx_frame[24 + (i * 2)] = (uint8_t)((snap.r2_y[i] >> 8) & 0xFF);
-            tx_frame[25 + (i * 2)] = (uint8_t)(snap.r2_y[i] & 0xFF);
+            tx_frame[6 + (i * 2)]   = (uint8_t)((snap.r1_x[i] >> 8) & 0xFF);
+            tx_frame[7 + (i * 2)]   = (uint8_t)(snap.r1_x[i] & 0xFF);
+            tx_frame[12 + (i * 2)]  = (uint8_t)((snap.r1_y[i] >> 8) & 0xFF);
+            tx_frame[13 + (i * 2)]  = (uint8_t)(snap.r1_y[i] & 0xFF);
+            tx_frame[18 + (i * 2)]  = (uint8_t)((snap.r2_x[i] >> 8) & 0xFF);
+            tx_frame[19 + (i * 2)]  = (uint8_t)(snap.r2_x[i] & 0xFF);
+            tx_frame[24 + (i * 2)]  = (uint8_t)((snap.r2_y[i] >> 8) & 0xFF);
+            tx_frame[25 + (i * 2)]  = (uint8_t)(snap.r2_y[i] & 0xFF);
         }
         tx_frame[30] = snap.r1_detected; tx_frame[31] = snap.r2_detected; tx_frame[32] = snap.emergency_code;
 
@@ -421,7 +454,6 @@ static void p4_rx_task(void *pvParameters) {
         if (len > 0) {
             int i = 0;
             while (i < len) {
-                // 1. 관제소 Codec 2 다운링크 프레임 (0x5A 0xA5 [LEN] [BYTES]) -> L/R 복제 I2S 출력
                 if ((i + 2 < len) && data[i] == 0x5A && data[i+1] == 0xA5) {
                     uint8_t c2_len = data[i+2];
                     if (i + 3 + c2_len <= len) {
@@ -628,7 +660,6 @@ static void mp3_player_task(void *pvParameters) {
     uint8_t *read_ptr = file_buf;
 
     while (1) {
-        // [수정] 음악 정지 상태에서도 트랙 교체 플래그 최우선 처리
         if (s_track_changed) {
             s_track_changed = false;
             current_playing_track = s_target_track;
@@ -716,18 +747,15 @@ static void mp3_player_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-void app_main(void) {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    s_sensor_mutex = xSemaphoreCreateMutex();
-    s_uart_tx_mutex = xSemaphoreCreateMutex();
+static void system_init_task(void *pvParameters) {
+    ESP_LOGI(TAG, "🚀 WROOM 메인 초기화 워커 태스크 시작 (12KB 스택)");
 
     s_c2_dec = codec2_create(CODEC2_MODE_2400);
+    if (!s_c2_dec) {
+        ESP_LOGE(TAG, "❌ Codec2 디코더 생성 실패!");
+    } else {
+        ESP_LOGI(TAG, "✅ Codec2 2400bps 디코더 생성 완료");
+    }
 
     nimble_port_init();
     ble_svc_gap_device_name_set("ESP32_WROOM_RECV");
@@ -741,6 +769,26 @@ void app_main(void) {
     xTaskCreatePinnedToCore(radar_process_task, "radar_process_task", 3072, NULL, 4, NULL, 0);
 
     if (init_sd_card() == ESP_OK) {
+        ESP_LOGI(TAG, "💾 SD 카드 마운트 성공! (%d곡 로드)", s_total_tracks);
         xTaskCreatePinnedToCore(mp3_player_task, "mp3_player_task", 8192, NULL, 5, NULL, 1);
+    } else {
+        ESP_LOGW(TAG, "⚠️ SD 카드가 없거나 마운트에 실패했습니다.");
     }
+
+    ESP_LOGI(TAG, "🎉 WROOM 시스템 준비 완료 -> S3 실시간 탐색 시작");
+    vTaskDelete(NULL);
+}
+
+void app_main(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    s_sensor_mutex = xSemaphoreCreateMutex();
+    s_uart_tx_mutex = xSemaphoreCreateMutex();
+
+    xTaskCreatePinnedToCore(system_init_task, "sys_init_task", 12288, NULL, 5, NULL, 0);
 }
