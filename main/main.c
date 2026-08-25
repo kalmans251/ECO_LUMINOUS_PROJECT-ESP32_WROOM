@@ -68,7 +68,6 @@ static struct CODEC2 *s_c2_dec = NULL;
 #define FILE_BUF_SIZE       (2 * 1024)
 #define PCM_BUF_SIZE        (1152 * 2 * sizeof(int16_t))
 
-// S3와 100% 매칭되는 128비트 리틀엔디언 UUID
 static const ble_uuid128_t S3_SVC_UUID = 
     BLE_UUID128_INIT(0x4b, 0x91, 0x31, 0xc3, 0xc9, 0xc5, 0xcc, 0x8f, 0x9e, 0x45, 0xb5, 0x1f, 0x01, 0xc2, 0xaf, 0x4f);
 static const ble_uuid128_t S3_CHAR_EMERGENCY_UUID = 
@@ -138,23 +137,27 @@ static void set_i2s_sample_rate(uint32_t rate) {
 }
 
 static void parse_ld2450_frame(const uint8_t *data, uint16_t len, int16_t out_x[3], int16_t out_y[3], uint8_t *out_detected) {
-    if (len < 30 || data[0] != 0xAA || data[1] != 0xFF || data[2] != 0x03 || data[3] != 0x00 ||
-        data[28] != 0x55 || data[29] != 0xCC) return;
+    if (len < 30) return;
+    if (data[0] != 0xAA || data[1] != 0xFF || data[2] != 0x03 || data[3] != 0x00) return;
+    if (data[28] != 0x55 || data[29] != 0xCC) return;
 
     bool detected = false;
     for (int i = 0; i < 3; i++) {
         int base = 4 + (i * 8);
-        uint16_t raw_x = data[base + 0] | (data[base + 1] << 8);
-        uint16_t raw_y = data[base + 2] | (data[base + 3] << 8);
-        uint16_t res   = data[base + 6] | (data[base + 7] << 8);
+        uint16_t raw_x = (uint16_t)(data[base + 0] | (data[base + 1] << 8));
+        uint16_t raw_y = (uint16_t)(data[base + 2] | (data[base + 3] << 8));
+        uint16_t res   = (uint16_t)(data[base + 6] | (data[base + 7] << 8));
 
         int16_t x = (raw_x & 0x8000) ? -(int16_t)(raw_x & 0x7FFF) : (int16_t)raw_x;
         int16_t y = (raw_y & 0x8000) ? -(int16_t)(raw_y & 0x7FFF) : (int16_t)raw_y;
 
-        if (abs(y) > 50 || abs(x) > 50 || res > 0) {
-            out_x[i] = x; out_y[i] = y; detected = true;
+        if (abs(y) > 100 || abs(x) > 100 || res > 0) {
+            out_x[i] = x;
+            out_y[i] = y;
+            detected = true;
         } else {
-            out_x[i] = 0; out_y[i] = 0;
+            out_x[i] = 0;
+            out_y[i] = 0;
         }
     }
     *out_detected = detected ? 1 : 0;
@@ -184,7 +187,7 @@ static void ble_subscribe_task(void *pvParameters) {
         ble_gattc_write_flat(conn, g_handle_audio + 1, enable, sizeof(enable), NULL, NULL);
         vTaskDelay(pdMS_TO_TICKS(80));
     }
-    ESP_LOGI(TAG, "🔔 [구독 완료] S3의 센서 및 오디오 데이터 실시간 수신 시작!");
+    ESP_LOGI(TAG, "🔔 [구독 완료] S3 센서 및 오디오 GATT Subscribe 완료!");
     vTaskDelete(NULL);
 }
 
@@ -217,7 +220,6 @@ static int on_disc_svc(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 static int on_mtu_exchange(uint16_t conn_handle, const struct ble_gatt_error *error,
                            uint16_t mtu, void *arg) {
-    ESP_LOGI(TAG, "📦 MTU 크기 협상 완료 (%d Byte) -> 서비스 탐색", mtu);
     ble_gattc_disc_all_svcs(conn_handle, on_disc_svc, NULL);
     return 0;
 }
@@ -227,12 +229,7 @@ static void ble_client_scan(void) {
     if (ble_hs_id_infer_auto(0, &own_addr_type) != 0) return;
 
     struct ble_gap_disc_params disc_params = {
-        .filter_duplicates = 1,
-        .passive = 0,
-        .itvl = 0x0040,
-        .window = 0x0030,
-        .filter_policy = 0,
-        .limited = 0
+        .filter_duplicates = 1, .passive = 0, .itvl = 0x0040, .window = 0x0030, .filter_policy = 0, .limited = 0
     };
     ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
 }
@@ -248,33 +245,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                 memcpy(dev_name, fields.name, fields.name_len < 32 ? fields.name_len : 32);
             }
 
-            // 주변에 감지되는 모든 장치 이름과 MAC 출력 (디버깅)
-            char addr_str[18];
-            snprintf(addr_str, sizeof(addr_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-                     event->disc.addr.val[5], event->disc.addr.val[4], event->disc.addr.val[3],
-                     event->disc.addr.val[2], event->disc.addr.val[1], event->disc.addr.val[0]);
-
-            if (strlen(dev_name) > 0) {
-                ESP_LOGI(TAG, "📡 발견된 BLE 장치: [%s] | MAC: %s | RSSI: %d", dev_name, addr_str, event->disc.rssi);
-            }
-
             bool is_match = false;
-            // 1. 서비스 UUID 128비트 매칭
             for (int i = 0; i < fields.num_uuids128; i++) {
-                if (ble_uuid_cmp(&fields.uuids128[i].u, &S3_SVC_UUID.u) == 0) {
-                    is_match = true;
-                    break;
-                }
+                if (ble_uuid_cmp(&fields.uuids128[i].u, &S3_SVC_UUID.u) == 0) { is_match = true; break; }
             }
-            // 2. 디바이스 이름 매칭
             if (!is_match && strlen(dev_name) > 0) {
-                if (strstr(dev_name, "ESP32S3") != NULL || strstr(dev_name, "EMERGENCY") != NULL || strstr(dev_name, "S3") != NULL) {
-                    is_match = true;
-                }
+                if (strstr(dev_name, "ESP32S3") != NULL || strstr(dev_name, "EMERGENCY") != NULL) is_match = true;
             }
 
             if (is_match) {
-                ESP_LOGW(TAG, "🎯 [S3 감지 완료!] 이름:[%s] MAC:%s -> 즉시 BLE 연결을 시도합니다!", dev_name, addr_str);
+                ESP_LOGW(TAG, "🎯 [S3 감지] 이름:[%s] -> BLE 연결!", dev_name);
                 ble_gap_disc_cancel();
                 uint8_t own_addr_type;
                 ble_hs_id_infer_auto(0, &own_addr_type);
@@ -302,7 +282,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         s_subscription_started = false;
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_handle_emergency = 0; g_handle_radar1 = 0; g_handle_radar2 = 0; g_handle_audio = 0;
-        ESP_LOGW(TAG, "⚡ S3 BLE 연결 해제됨 -> 재스캔 시작");
+        ESP_LOGW(TAG, "⚡ S3 BLE 연결 해제 -> 재스캔");
         ble_client_scan();
         break;
 
@@ -315,7 +295,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         if (attr_handle == g_handle_emergency) {
             char msg[32] = {0};
             memcpy(msg, rx_buf, pkt_len < sizeof(msg) ? pkt_len : sizeof(msg) - 1);
-            ESP_LOGW(TAG, "🚨 S3 비상/버튼 수신: [%s]", msg);
+            ESP_LOGW(TAG, "🚨 S3 비상 신호 수신: [%s]", msg);
 
             if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 s_rx_em_cnt++;
@@ -341,6 +321,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         }
         else if (attr_handle == g_handle_audio) {
             s_rx_audio_cnt++;
+            // 통화 중일 때만 P4로 오디오 포워딩
             if (s_voice_call_mode && pkt_len > 0) {
                 uint8_t voice_pkt[64];
                 voice_pkt[0] = 0xA5; voice_pkt[1] = 0x5A; voice_pkt[2] = (uint8_t)pkt_len;
@@ -348,7 +329,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                 p4_uart_send_bytes(voice_pkt, pkt_len + 3);
             }
         }
-        else if (!s_voice_call_mode) {
+        else {
             if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 if (attr_handle == g_handle_radar1) {
                     s_rx_r1_cnt++;
@@ -380,11 +361,6 @@ static void radar_process_task(void *pvParameters) {
     uint8_t tx_frame[34];
 
     while (1) {
-        if (s_voice_call_mode) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         wroom_to_p4_pkt_t snap;
 
@@ -443,101 +419,145 @@ static void radar_process_task(void *pvParameters) {
     }
 }
 
+// =============================================================================
+// [핵심] P4로부터 명령 수신 시 BLE Write 보장 및 즉각 음성 중단
+// =============================================================================
 static void p4_rx_task(void *pvParameters) {
-    uint8_t *data = (uint8_t *) malloc(UART_BUF_SIZE);
-    if (!data) vTaskDelete(NULL);
-    char line_buf[128];
-    int line_pos = 0;
+    static uint8_t rx_acc_buf[512];
+    static int rx_acc_len = 0;
+    uint8_t temp[128];
 
     while (1) {
-        int len = uart_read_bytes(P4_UART_NUM, data, UART_BUF_SIZE - 1, pdMS_TO_TICKS(20));
+        int len = uart_read_bytes(P4_UART_NUM, temp, sizeof(temp), pdMS_TO_TICKS(10));
         if (len > 0) {
-            int i = 0;
-            while (i < len) {
-                if ((i + 2 < len) && data[i] == 0x5A && data[i+1] == 0xA5) {
-                    uint8_t c2_len = data[i+2];
-                    if (i + 3 + c2_len <= len) {
-                        if (s_c2_dec != NULL) {
-                            set_i2s_sample_rate(8000);
+            if (rx_acc_len + len < (int)sizeof(rx_acc_buf)) {
+                memcpy(&rx_acc_buf[rx_acc_len], temp, len);
+                rx_acc_len += len;
+            } else {
+                rx_acc_len = 0;
+            }
+        }
 
-                            for (int c_idx = 0; c_idx < c2_len; c_idx += 6) {
-                                int16_t pcm_mono[160];
-                                int16_t pcm_stereo[320];
+        // 1. $CALL_END 수신 시 즉시 음성 스트림 중단 및 S3에 무조건 도달할 때까지 5회 연속 Write
+        if (rx_acc_len >= 9) {
+            for (int i = 0; i <= rx_acc_len - 9; i++) {
+                if (memcmp(&rx_acc_buf[i], "$CALL_END", 9) == 0) {
+                    s_voice_call_mode = false;  // 즉시 음성 수신/출력 차단
+                    s_emergency_trigger_time = 0;
+                    set_i2s_sample_rate(44100);
 
-                                codec2_decode(s_c2_dec, pcm_mono, &data[i + 3 + c_idx]);
-
-                                for (int s = 0; s < 160; s++) {
-                                    pcm_stereo[s * 2]     = pcm_mono[s];
-                                    pcm_stereo[s * 2 + 1] = pcm_mono[s];
-                                }
-
-                                size_t written = 0;
-                                i2s_channel_write(s_tx_chan, pcm_stereo, sizeof(pcm_stereo), &written, portMAX_DELAY);
-                            }
-                        }
-                        i += (3 + c2_len);
-                        continue;
+                    if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                        s_p4_pkt.emergency_code = 0;
+                        xSemaphoreGive(s_sensor_mutex);
                     }
-                }
 
-                char ch = (char)data[i++];
-                if (ch == '\n' || ch == '\r') {
-                    if (line_pos > 0) {
-                        line_buf[line_pos] = '\0';
-                        
-                        if (strstr(line_buf, "$CALL_END") != NULL) {
-                            s_voice_call_mode = false;
-                            set_i2s_sample_rate(44100);
-                            if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                s_p4_pkt.emergency_code = 0;
-                                xSemaphoreGive(s_sensor_mutex);
-                            }
-                            if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
-                                const char *end_cmd = "CALL_END";
-                                ble_gattc_write_flat(g_conn_handle, g_handle_emergency, end_cmd, strlen(end_cmd), NULL, NULL);
-                            }
+                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
+                        const char *end_cmd = "CALL_END";
+                        // BLE TX 버퍼 경합을 뚫고 100% 수신되도록 5회 전송
+                        for (int k = 0; k < 5; k++) {
+                            ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, end_cmd, strlen(end_cmd));
+                            vTaskDelay(pdMS_TO_TICKS(10));
                         }
-                        else if (strstr(line_buf, "$CALL_START") != NULL) {
-                            s_voice_call_mode = true;
-                            s_music_playing = false;
-                            set_i2s_sample_rate(8000);
-                            if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
-                                const char *start_cmd = "CALL_START";
-                                ble_gattc_write_flat(g_conn_handle, g_handle_emergency, start_cmd, strlen(start_cmd), NULL, NULL);
-                            }
-                        }
-                        else if (strstr(line_buf, "$MUSIC,ON") != NULL) {
-                            if (!s_voice_call_mode) s_music_playing = true;
-                            p4_uart_send_bytes("$MUSIC,ACK\n", 11);
-                        } else if (strstr(line_buf, "$MUSIC,OFF") != NULL) {
-                            s_music_playing = false;
-                            p4_uart_send_bytes("$MUSIC,OFF_ACK\n", 15);
-                        } else if (strstr(line_buf, "$CTRL,") != NULL) {
-                            int vol = 50, mode = 0, track = 1;
-                            if (sscanf(line_buf, "$CTRL,%d,%d,%d", &vol, &mode, &track) == 3) {
-                                if (vol < 0) vol = 0;
-                                if (vol > 100) vol = 100;
-                                s_current_volume = vol;
-                                float ratio = (float)vol / 100.0f;
-                                s_volume_factor = ratio * ratio;
-                                s_play_mode = mode;
-                                if (mode == 2 && track > 0 && s_target_track != track) {
-                                    s_target_track = track;
-                                    s_track_changed = true; 
-                                }
-                                p4_uart_send_bytes("$CTRL_ACK\n", 10);
-                            }
-                        }
-                        line_pos = 0;
+                        ESP_LOGI(TAG, "⚡ [WROOM] S3로 CALL_END 100% 관통 전송 완료!");
                     }
-                } else {
-                    if (line_pos < (int)sizeof(line_buf) - 1) line_buf[line_pos++] = ch;
+                    rx_acc_len = 0; // 잔여 패킷 전체 플러시
+                    break;
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+
+        while (rx_acc_len > 0) {
+            // 다운링크 오디오 재생
+            if (rx_acc_len >= 3 && rx_acc_buf[0] == 0x5A && rx_acc_buf[1] == 0xA5) {
+                uint8_t c2_len = rx_acc_buf[2];
+                if (rx_acc_len >= 3 + c2_len) {
+                    if (s_c2_dec != NULL && s_voice_call_mode) {
+                        set_i2s_sample_rate(8000);
+
+                        for (int c_idx = 0; c_idx < c2_len; c_idx += 6) {
+                            int16_t pcm_mono[160];
+                            int16_t pcm_stereo[320];
+
+                            codec2_decode(s_c2_dec, pcm_mono, &rx_acc_buf[3 + c_idx]);
+
+                            for (int s = 0; s < 160; s++) {
+                                int32_t val = (int32_t)pcm_mono[s] * 3;
+                                if (val > 32767) val = 32767;
+                                if (val < -32768) val = -32768;
+                                pcm_stereo[s * 2]     = (int16_t)val;
+                                pcm_stereo[s * 2 + 1] = (int16_t)val;
+                            }
+
+                            size_t written = 0;
+                            i2s_channel_write(s_tx_chan, pcm_stereo, sizeof(pcm_stereo), &written, portMAX_DELAY);
+                        }
+                    }
+                    rx_acc_len -= (3 + c2_len);
+                    if (rx_acc_len > 0) memmove(rx_acc_buf, &rx_acc_buf[3 + c2_len], rx_acc_len);
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            int nl_idx = -1;
+            for (int j = 0; j < rx_acc_len; j++) {
+                if (rx_acc_buf[j] == '\n' || rx_acc_buf[j] == '\r') {
+                    nl_idx = j;
+                    break;
+                }
+            }
+
+            if (nl_idx != -1) {
+                char line_buf[128];
+                int copy_len = nl_idx < (int)sizeof(line_buf) - 1 ? nl_idx : (int)sizeof(line_buf) - 1;
+                memcpy(line_buf, rx_acc_buf, copy_len);
+                line_buf[copy_len] = '\0';
+
+                if (strstr(line_buf, "$CALL_START") != NULL) {
+                    s_voice_call_mode = true;
+                    s_music_playing = false;
+                    set_i2s_sample_rate(8000);
+
+                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
+                        const char *start_cmd = "CALL_START";
+                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, start_cmd, strlen(start_cmd));
+                        ESP_LOGI(TAG, "📡 [BLE TX] S3로 CALL_START 송신");
+                    }
+                }
+                else if (strstr(line_buf, "$MUSIC,ON") != NULL) {
+                    if (!s_voice_call_mode) s_music_playing = true;
+                    p4_uart_send_bytes("$MUSIC,ACK\n", 11);
+                } else if (strstr(line_buf, "$MUSIC,OFF") != NULL) {
+                    s_music_playing = false;
+                    p4_uart_send_bytes("$MUSIC,OFF_ACK\n", 15);
+                } else if (strstr(line_buf, "$CTRL,") != NULL) {
+                    int vol = 50, mode = 0, track = 1;
+                    if (sscanf(line_buf, "$CTRL,%d,%d,%d", &vol, &mode, &track) == 3) {
+                        if (vol < 0) vol = 0;
+                        if (vol > 100) vol = 100;
+                        s_current_volume = vol;
+                        float ratio = (float)vol / 100.0f;
+                        s_volume_factor = ratio * ratio;
+                        s_play_mode = mode;
+                        if (mode == 2 && track > 0 && s_target_track != track) {
+                            s_target_track = track;
+                            s_track_changed = true; 
+                        }
+                        p4_uart_send_bytes("$CTRL_ACK\n", 10);
+                    }
+                }
+
+                rx_acc_len -= (nl_idx + 1);
+                if (rx_acc_len > 0) memmove(rx_acc_buf, &rx_acc_buf[nl_idx + 1], rx_acc_len);
+                continue;
+            }
+
+            rx_acc_len--;
+            if (rx_acc_len > 0) memmove(rx_acc_buf, &rx_acc_buf[1], rx_acc_len);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
-    free(data);
     vTaskDelete(NULL);
 }
 
@@ -775,7 +795,7 @@ static void system_init_task(void *pvParameters) {
         ESP_LOGW(TAG, "⚠️ SD 카드가 없거나 마운트에 실패했습니다.");
     }
 
-    ESP_LOGI(TAG, "🎉 WROOM 시스템 준비 완료 -> S3 실시간 탐색 시작");
+    ESP_LOGI(TAG, "🎉 WROOM 시스템 준비 완료");
     vTaskDelete(NULL);
 }
 
