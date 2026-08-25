@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -37,6 +38,7 @@
 #define I2S_DOUT_PIN        32
 
 static i2s_chan_handle_t    s_tx_chan = NULL;
+static SemaphoreHandle_t    s_i2s_mutex = NULL;
 static uint32_t             s_current_sample_rate = 44100;
 
 #define P4_UART_NUM         UART_NUM_2
@@ -56,6 +58,7 @@ static volatile int s_play_mode = 0;
 static volatile int s_target_track = 1;          
 static volatile bool s_track_changed = false;     
 static volatile bool s_voice_call_mode = false;
+static volatile bool s_ble_connected = false;
 
 static struct CODEC2 *s_c2_dec = NULL;
 
@@ -67,6 +70,13 @@ static struct CODEC2 *s_c2_dec = NULL;
 
 #define FILE_BUF_SIZE       (2 * 1024)
 #define PCM_BUF_SIZE        (1152 * 2 * sizeof(int16_t))
+
+typedef struct {
+    uint8_t len;
+    uint8_t data[64];
+} voice_downlink_msg_t;
+
+static QueueHandle_t s_voice_queue = NULL;
 
 static const ble_uuid128_t S3_SVC_UUID = 
     BLE_UUID128_INIT(0x4b, 0x91, 0x31, 0xc3, 0xc9, 0xc5, 0xcc, 0x8f, 0x9e, 0x45, 0xb5, 0x1f, 0x01, 0xc2, 0xaf, 0x4f);
@@ -117,8 +127,10 @@ static volatile uint32_t s_rx_r1_cnt = 0;
 static volatile uint32_t s_rx_r2_cnt = 0;
 static volatile uint32_t s_rx_em_cnt = 0;
 static volatile uint32_t s_rx_audio_cnt = 0;
-static volatile bool s_ble_connected = false;
 static uint32_t s_emergency_trigger_time = 0;
+
+// [추가] 스피커가 물리적으로 재생 중임을 나타내는 최신 재생 시각 타이머
+static volatile uint32_t s_last_play_time = 0; 
 
 static void p4_uart_send_bytes(const void *data, size_t len) {
     if (s_uart_tx_mutex && xSemaphoreTake(s_uart_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -127,12 +139,15 @@ static void p4_uart_send_bytes(const void *data, size_t len) {
     }
 }
 
-static void set_i2s_sample_rate(uint32_t rate) {
-    if (s_current_sample_rate != rate) {
-        s_current_sample_rate = rate;
+static void set_i2s_sample_rate_locked(uint32_t rate) {
+    if (s_current_sample_rate != rate && s_tx_chan != NULL) {
+        i2s_channel_disable(s_tx_chan);
         i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+        clk_cfg.clk_src = I2S_CLK_SRC_APLL; 
         i2s_channel_reconfig_std_clock(s_tx_chan, &clk_cfg);
-        ESP_LOGI(TAG, "🎵 I2S DAC 샘플레이트 전환: %lu Hz", rate);
+        i2s_channel_enable(s_tx_chan);
+        s_current_sample_rate = rate;
+        ESP_LOGI(TAG, "🎵 [오디오 시스템] I2S DAC 샘플레이트 전환: %lu Hz (APLL)", rate);
     }
 }
 
@@ -163,6 +178,67 @@ static void parse_ld2450_frame(const uint8_t *data, uint16_t len, int16_t out_x[
     *out_detected = detected ? 1 : 0;
 }
 
+static void scan_sd_mp3_files(void) {
+    DIR *dir = opendir(MOUNT_POINT);
+    if (!dir) return;
+
+    for (int i = 0; i < s_total_tracks; i++) {
+        if (s_track_list[i]) { free(s_track_list[i]); s_track_list[i] = NULL; }
+    }
+    s_total_tracks = 0;
+
+    struct dirent *entry;
+    char path_buf[MAX_PATH_LEN];
+    while ((entry = readdir(dir)) != NULL && s_total_tracks < MAX_TRACKS) {
+        if (entry->d_type == DT_REG || entry->d_type == DT_UNKNOWN) {
+            char *ext = strrchr(entry->d_name, '.');
+            if (ext && (strcasecmp(ext, ".mp3") == 0)) {
+                snprintf(path_buf, sizeof(path_buf), "%s/%s", MOUNT_POINT, entry->d_name);
+                s_track_list[s_total_tracks++] = strdup(path_buf);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+static esp_err_t init_sd_card(void) {
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false, .max_files = 5, .allocation_unit_size = 16 * 1024
+    };
+    sdmmc_card_t *card;
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI, .miso_io_num = PIN_NUM_MISO, .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 4000,
+    };
+    if (spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA) != ESP_OK) return ESP_FAIL;
+
+    sdmmc_host_t host_config = SDSPI_HOST_DEFAULT();
+    host_config.slot = SPI2_HOST;
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = SPI2_HOST;
+
+    esp_err_t ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host_config, &slot_config, &mount_config, &card);
+    if (ret == ESP_OK) scan_sd_mp3_files();
+    return ret;
+}
+
+static FILE* open_mp3_track_file(int track_num) {
+    if (s_total_tracks > 0) {
+        int index = (track_num - 1) % s_total_tracks;
+        if (index < 0) index = 0;
+        if (s_track_list[index]) {
+            FILE *f = fopen(s_track_list[index], "rb");
+            if (f) return f;
+        }
+    }
+    char filepath[MAX_PATH_LEN];
+    snprintf(filepath, sizeof(filepath), MOUNT_POINT "/music%d.mp3", track_num);
+    FILE *f = fopen(filepath, "rb");
+    if (!f && track_num != 1) f = fopen(MOUNT_POINT "/music1.mp3", "rb");
+    return f;
+}
+
 static void ble_client_scan(void);
 static int ble_gap_event(struct ble_gap_event *event, void *arg);
 
@@ -187,7 +263,7 @@ static void ble_subscribe_task(void *pvParameters) {
         ble_gattc_write_flat(conn, g_handle_audio + 1, enable, sizeof(enable), NULL, NULL);
         vTaskDelay(pdMS_TO_TICKS(80));
     }
-    ESP_LOGI(TAG, "🔔 [구독 완료] S3 센서 및 오디오 GATT Subscribe 완료!");
+    ESP_LOGI(TAG, "🔔 [GATT Subscribe] 센서 및 오디오 구독 완료");
     vTaskDelete(NULL);
 }
 
@@ -295,7 +371,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         if (attr_handle == g_handle_emergency) {
             char msg[32] = {0};
             memcpy(msg, rx_buf, pkt_len < sizeof(msg) ? pkt_len : sizeof(msg) - 1);
-            ESP_LOGW(TAG, "🚨 S3 비상 신호 수신: [%s]", msg);
 
             if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 s_rx_em_cnt++;
@@ -309,11 +384,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                     s_emergency_trigger_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
                     s_voice_call_mode = true;
                     s_music_playing = false;
-                    set_i2s_sample_rate(8000);
                     p4_uart_send_bytes("$CALL_START\n", 12);
                 } else {
                     s_voice_call_mode = false;
-                    set_i2s_sample_rate(44100);
                     p4_uart_send_bytes("$CALL_END\n", 10);
                 }
                 xSemaphoreGive(s_sensor_mutex);
@@ -321,29 +394,42 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         }
         else if (attr_handle == g_handle_audio) {
             s_rx_audio_cnt++;
-            // 통화 중일 때만 P4로 오디오 포워딩
             if (s_voice_call_mode && pkt_len > 0) {
-                uint8_t voice_pkt[64];
-                voice_pkt[0] = 0xA5; voice_pkt[1] = 0x5A; voice_pkt[2] = (uint8_t)pkt_len;
-                memcpy(&voice_pkt[3], rx_buf, pkt_len);
-                p4_uart_send_bytes(voice_pkt, pkt_len + 3);
+                uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                
+                // [정답 로직] 큐에 대기 중인 오디오가 있거나, 마지막 스피커 재생 후 0.8초가 안 지났다면 
+                // 스피커가 울리는 중이므로 현장 마이크를 닫아 에코(하울링)를 막습니다.
+                bool is_speaker_busy = (uxQueueMessagesWaiting(s_voice_queue) > 0) || (now - s_last_play_time < 800);
+                
+                // 스피커가 완벽하게 조용할 때만 현장 소리를 올려보냄
+                if (!is_speaker_busy) {
+                    uint8_t voice_pkt[64];
+                    voice_pkt[0] = 0xA5; voice_pkt[1] = 0x5A; voice_pkt[2] = (uint8_t)pkt_len;
+                    memcpy(&voice_pkt[3], rx_buf, pkt_len);
+                    p4_uart_send_bytes(voice_pkt, pkt_len + 3);
+                }
             }
         }
-        else {
-            if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                if (attr_handle == g_handle_radar1) {
+        else if (attr_handle == g_handle_radar1) {
+            if (!s_voice_call_mode) {
+                if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     s_rx_r1_cnt++;
                     parse_ld2450_frame(rx_buf, pkt_len, s_p4_pkt.r1_x, s_p4_pkt.r1_y, &s_p4_pkt.r1_detected);
-                } else if (attr_handle == g_handle_radar2) {
+                    xSemaphoreGive(s_sensor_mutex);
+                }
+            }
+        }
+        else if (attr_handle == g_handle_radar2) {
+            if (!s_voice_call_mode) {
+                if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     s_rx_r2_cnt++;
                     parse_ld2450_frame(rx_buf, pkt_len, s_p4_pkt.r2_x, s_p4_pkt.r2_y, &s_p4_pkt.r2_detected);
+                    xSemaphoreGive(s_sensor_mutex);
                 }
-                xSemaphoreGive(s_sensor_mutex);
             }
         }
         break;
     }
-
     default:
         break;
     }
@@ -361,6 +447,11 @@ static void radar_process_task(void *pvParameters) {
     uint8_t tx_frame[34];
 
     while (1) {
+        if (s_voice_call_mode) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         wroom_to_p4_pkt_t snap;
 
@@ -389,7 +480,6 @@ static void radar_process_task(void *pvParameters) {
             } else {
                 tracking_state = 0; prev_primary_y = 0;
             }
-
             snap = s_p4_pkt;
             xSemaphoreGive(s_sensor_mutex);
         }
@@ -420,31 +510,91 @@ static void radar_process_task(void *pvParameters) {
 }
 
 // =============================================================================
-// [핵심] P4로부터 명령 수신 시 BLE Write 보장 및 즉각 음성 중단
+// [수정] 오디오 재생 워커 - 즉시 재생 및 재생 시간 타이머 기록
 // =============================================================================
-static void p4_rx_task(void *pvParameters) {
-    static uint8_t rx_acc_buf[512];
-    static int rx_acc_len = 0;
-    uint8_t temp[128];
+static int16_t s_voice_pcm_8k[160];
+static int16_t s_voice_stereo_8k[160 * 2];
+
+static void voice_play_worker_task(void *pvParameters) {
+    voice_downlink_msg_t msg;
 
     while (1) {
-        int len = uart_read_bytes(P4_UART_NUM, temp, sizeof(temp), pdMS_TO_TICKS(10));
+        if (!s_voice_call_mode) {
+            xQueueReset(s_voice_queue);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (xQueueReceive(s_voice_queue, &msg, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (s_c2_dec != NULL && msg.len > 0) {
+                
+                s_last_play_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                
+                if (xSemaphoreTake(s_i2s_mutex, portMAX_DELAY) == pdTRUE) {
+                    set_i2s_sample_rate_locked(8000);
+
+                    for (int c_idx = 0; c_idx < msg.len; c_idx += 6) {
+                        if (msg.len - c_idx < 6) break;
+
+                        codec2_decode(s_c2_dec, s_voice_pcm_8k, &msg.data[c_idx]);
+
+                        for (int s = 0; s < 160; s++) {
+                            // ----------------------------------------------------
+                            // [볼륨 조절 부분] 곱하기와 나누기를 통해 원하는 %로 맞춥니다.
+                            // 예: 원본의 50% 볼륨 -> * 5 / 10
+                            // 예: 원본의 30% 볼륨 -> * 3 / 10
+                            // 예: 원본의 70% 볼륨 -> * 7 / 10
+                            // ----------------------------------------------------
+                            int32_t val = ((int32_t)s_voice_pcm_8k[s] * 1) / 10; 
+                            
+                            if (val > 32767) val = 32767;
+                            if (val < -32768) val = -32768;
+                            s_voice_stereo_8k[s * 2]     = (int16_t)val;
+                            s_voice_stereo_8k[s * 2 + 1] = (int16_t)val;
+                        }
+
+                        size_t written = 0;
+                        i2s_channel_write(s_tx_chan, s_voice_stereo_8k, sizeof(s_voice_stereo_8k), &written, portMAX_DELAY);
+                    }
+                    xSemaphoreGive(s_i2s_mutex);
+                }
+            }
+        } else {
+            // 소리가 없을 때는 스피커 무음 처리
+            if (xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                set_i2s_sample_rate_locked(8000);
+                memset(s_voice_stereo_8k, 0, sizeof(s_voice_stereo_8k));
+                size_t written = 0;
+                i2s_channel_write(s_tx_chan, s_voice_stereo_8k, sizeof(s_voice_stereo_8k), &written, pdMS_TO_TICKS(5));
+                xSemaphoreGive(s_i2s_mutex);
+            }
+        }
+    }
+}
+static uint8_t s_rx_acc_buf[512];
+static int s_rx_acc_len = 0;
+static uint8_t s_uart_temp[128];
+static char s_line_buf[128];
+
+static void p4_rx_task(void *pvParameters) {
+    s_rx_acc_len = 0;
+
+    while (1) {
+        int len = uart_read_bytes(P4_UART_NUM, s_uart_temp, sizeof(s_uart_temp), pdMS_TO_TICKS(5));
         if (len > 0) {
-            if (rx_acc_len + len < (int)sizeof(rx_acc_buf)) {
-                memcpy(&rx_acc_buf[rx_acc_len], temp, len);
-                rx_acc_len += len;
+            if (s_rx_acc_len + len < (int)sizeof(s_rx_acc_buf)) {
+                memcpy(&s_rx_acc_buf[s_rx_acc_len], s_uart_temp, len);
+                s_rx_acc_len += len;
             } else {
-                rx_acc_len = 0;
+                s_rx_acc_len = 0;
             }
         }
 
-        // 1. $CALL_END 수신 시 즉시 음성 스트림 중단 및 S3에 무조건 도달할 때까지 5회 연속 Write
-        if (rx_acc_len >= 9) {
-            for (int i = 0; i <= rx_acc_len - 9; i++) {
-                if (memcmp(&rx_acc_buf[i], "$CALL_END", 9) == 0) {
-                    s_voice_call_mode = false;  // 즉시 음성 수신/출력 차단
-                    s_emergency_trigger_time = 0;
-                    set_i2s_sample_rate(44100);
+        if (s_rx_acc_len >= 9) {
+            for (int i = 0; i <= s_rx_acc_len - 9; i++) {
+                if (memcmp(&s_rx_acc_buf[i], "$CALL_END", 9) == 0) {
+                    s_voice_call_mode = false;
+                    xQueueReset(s_voice_queue); 
 
                     if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                         s_p4_pkt.emergency_code = 0;
@@ -453,47 +603,36 @@ static void p4_rx_task(void *pvParameters) {
 
                     if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
                         const char *end_cmd = "CALL_END";
-                        // BLE TX 버퍼 경합을 뚫고 100% 수신되도록 5회 전송
                         for (int k = 0; k < 5; k++) {
                             ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, end_cmd, strlen(end_cmd));
-                            vTaskDelay(pdMS_TO_TICKS(10));
+                            vTaskDelay(pdMS_TO_TICKS(5));
                         }
-                        ESP_LOGI(TAG, "⚡ [WROOM] S3로 CALL_END 100% 관통 전송 완료!");
                     }
-                    rx_acc_len = 0; // 잔여 패킷 전체 플러시
+                    s_rx_acc_len = 0; 
+                    ESP_LOGW(TAG, "🔴 [통화 종료] 통화 기능 정지 및 큐 초기화");
                     break;
                 }
             }
         }
 
-        while (rx_acc_len > 0) {
-            // 다운링크 오디오 재생
-            if (rx_acc_len >= 3 && rx_acc_buf[0] == 0x5A && rx_acc_buf[1] == 0xA5) {
-                uint8_t c2_len = rx_acc_buf[2];
-                if (rx_acc_len >= 3 + c2_len) {
-                    if (s_c2_dec != NULL && s_voice_call_mode) {
-                        set_i2s_sample_rate(8000);
-
-                        for (int c_idx = 0; c_idx < c2_len; c_idx += 6) {
-                            int16_t pcm_mono[160];
-                            int16_t pcm_stereo[320];
-
-                            codec2_decode(s_c2_dec, pcm_mono, &rx_acc_buf[3 + c_idx]);
-
-                            for (int s = 0; s < 160; s++) {
-                                int32_t val = (int32_t)pcm_mono[s] * 3;
-                                if (val > 32767) val = 32767;
-                                if (val < -32768) val = -32768;
-                                pcm_stereo[s * 2]     = (int16_t)val;
-                                pcm_stereo[s * 2 + 1] = (int16_t)val;
-                            }
-
-                            size_t written = 0;
-                            i2s_channel_write(s_tx_chan, pcm_stereo, sizeof(pcm_stereo), &written, portMAX_DELAY);
+        while (s_rx_acc_len > 0) {
+            if (s_rx_acc_len >= 3 && s_rx_acc_buf[0] == 0x5A && s_rx_acc_buf[1] == 0xA5) {
+                uint8_t c2_len = s_rx_acc_buf[2];
+                if (s_rx_acc_len >= 3 + c2_len) {
+                    if (s_voice_call_mode && c2_len <= sizeof(((voice_downlink_msg_t*)0)->data)) {
+                        voice_downlink_msg_t msg;
+                        msg.len = c2_len;
+                        memcpy(msg.data, &s_rx_acc_buf[3], c2_len);
+                        
+                        // [수정] 큐가 꽉 차면 밀린 과거 소리를 버리고 새로운 최신 소리를 즉시 수신
+                        if (uxQueueSpacesAvailable(s_voice_queue) == 0) {
+                            voice_downlink_msg_t dummy;
+                            xQueueReceive(s_voice_queue, &dummy, 0); 
                         }
+                        xQueueSend(s_voice_queue, &msg, 0);
                     }
-                    rx_acc_len -= (3 + c2_len);
-                    if (rx_acc_len > 0) memmove(rx_acc_buf, &rx_acc_buf[3 + c2_len], rx_acc_len);
+                    s_rx_acc_len -= (3 + c2_len);
+                    if (s_rx_acc_len > 0) memmove(s_rx_acc_buf, &s_rx_acc_buf[3 + c2_len], s_rx_acc_len);
                     continue;
                 } else {
                     break;
@@ -501,39 +640,41 @@ static void p4_rx_task(void *pvParameters) {
             }
 
             int nl_idx = -1;
-            for (int j = 0; j < rx_acc_len; j++) {
-                if (rx_acc_buf[j] == '\n' || rx_acc_buf[j] == '\r') {
-                    nl_idx = j;
-                    break;
+            for (int j = 0; j < s_rx_acc_len; j++) {
+                if (s_rx_acc_buf[j] == '\n' || s_rx_acc_buf[j] == '\r') {
+                    nl_idx = j; break;
                 }
             }
 
             if (nl_idx != -1) {
-                char line_buf[128];
-                int copy_len = nl_idx < (int)sizeof(line_buf) - 1 ? nl_idx : (int)sizeof(line_buf) - 1;
-                memcpy(line_buf, rx_acc_buf, copy_len);
-                line_buf[copy_len] = '\0';
+                int copy_len = nl_idx < (int)sizeof(s_line_buf) - 1 ? nl_idx : (int)sizeof(s_line_buf) - 1;
+                memcpy(s_line_buf, s_rx_acc_buf, copy_len);
+                s_line_buf[copy_len] = '\0';
 
-                if (strstr(line_buf, "$CALL_START") != NULL) {
+                if (strstr(s_line_buf, "$CALL_START") != NULL) {
                     s_voice_call_mode = true;
                     s_music_playing = false;
-                    set_i2s_sample_rate(8000);
+                    xQueueReset(s_voice_queue);
+                    ESP_LOGW(TAG, "🚨 [통화 시작] 음악/레이더 정지 (마이크만 활성)");
 
                     if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
                         const char *start_cmd = "CALL_START";
-                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, start_cmd, strlen(start_cmd));
-                        ESP_LOGI(TAG, "📡 [BLE TX] S3로 CALL_START 송신");
+                        for (int k = 0; k < 5; k++) {
+                            ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, start_cmd, strlen(start_cmd));
+                            vTaskDelay(pdMS_TO_TICKS(5));
+                        }
+                        ESP_LOGI(TAG, "📡 [BLE TX] S3로 CALL_START 전송 완료! (마이크 On)");
                     }
                 }
-                else if (strstr(line_buf, "$MUSIC,ON") != NULL) {
+                else if (strstr(s_line_buf, "$MUSIC,ON") != NULL) {
                     if (!s_voice_call_mode) s_music_playing = true;
                     p4_uart_send_bytes("$MUSIC,ACK\n", 11);
-                } else if (strstr(line_buf, "$MUSIC,OFF") != NULL) {
+                } else if (strstr(s_line_buf, "$MUSIC,OFF") != NULL) {
                     s_music_playing = false;
                     p4_uart_send_bytes("$MUSIC,OFF_ACK\n", 15);
-                } else if (strstr(line_buf, "$CTRL,") != NULL) {
+                } else if (strstr(s_line_buf, "$CTRL,") != NULL) {
                     int vol = 50, mode = 0, track = 1;
-                    if (sscanf(line_buf, "$CTRL,%d,%d,%d", &vol, &mode, &track) == 3) {
+                    if (sscanf(s_line_buf, "$CTRL,%d,%d,%d", &vol, &mode, &track) == 3) {
                         if (vol < 0) vol = 0;
                         if (vol > 100) vol = 100;
                         s_current_volume = vol;
@@ -548,110 +689,16 @@ static void p4_rx_task(void *pvParameters) {
                     }
                 }
 
-                rx_acc_len -= (nl_idx + 1);
-                if (rx_acc_len > 0) memmove(rx_acc_buf, &rx_acc_buf[nl_idx + 1], rx_acc_len);
+                s_rx_acc_len -= (nl_idx + 1);
+                if (s_rx_acc_len > 0) memmove(s_rx_acc_buf, &s_rx_acc_buf[nl_idx + 1], s_rx_acc_len);
                 continue;
             }
 
-            rx_acc_len--;
-            if (rx_acc_len > 0) memmove(rx_acc_buf, &rx_acc_buf[1], rx_acc_len);
+            s_rx_acc_len--;
+            if (s_rx_acc_len > 0) memmove(s_rx_acc_buf, &s_rx_acc_buf[1], s_rx_acc_len);
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(1);
     }
-    vTaskDelete(NULL);
-}
-
-static esp_err_t init_i2s_driver(void) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 256;
-    chan_cfg.auto_clear = true;
-
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED, .bclk = I2S_BCLK_PIN, .ws = I2S_LRCK_PIN, .dout = I2S_DOUT_PIN, .din = I2S_GPIO_UNUSED,
-            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
-        },
-    };
-
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
-    return ESP_OK;
-}
-
-static void init_p4_uarts(void) {
-    uart_config_t uart_ctrl_cfg = {
-        .baud_rate = 115200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_ERROR_CHECK(uart_driver_install(P4_UART_NUM, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(P4_UART_NUM, &uart_ctrl_cfg));
-    ESP_ERROR_CHECK(uart_set_pin(P4_UART_NUM, P4_TX_PIN, P4_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-}
-
-static void scan_sd_mp3_files(void) {
-    DIR *dir = opendir(MOUNT_POINT);
-    if (!dir) return;
-
-    for (int i = 0; i < s_total_tracks; i++) {
-        if (s_track_list[i]) { free(s_track_list[i]); s_track_list[i] = NULL; }
-    }
-    s_total_tracks = 0;
-
-    struct dirent *entry;
-    char path_buf[MAX_PATH_LEN];
-    while ((entry = readdir(dir)) != NULL && s_total_tracks < MAX_TRACKS) {
-        if (entry->d_type == DT_REG || entry->d_type == DT_UNKNOWN) {
-            char *ext = strrchr(entry->d_name, '.');
-            if (ext && (strcasecmp(ext, ".mp3") == 0)) {
-                snprintf(path_buf, sizeof(path_buf), "%s/%s", MOUNT_POINT, entry->d_name);
-                s_track_list[s_total_tracks++] = strdup(path_buf);
-            }
-        }
-    }
-    closedir(dir);
-}
-
-static esp_err_t init_sd_card(void) {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false, .max_files = 5, .allocation_unit_size = 16 * 1024
-    };
-    sdmmc_card_t *card;
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI, .miso_io_num = PIN_NUM_MISO, .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 4000,
-    };
-    if (spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA) != ESP_OK) return ESP_FAIL;
-
-    sdmmc_host_t host_config = SDSPI_HOST_DEFAULT();
-    host_config.slot = SPI2_HOST;
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = PIN_NUM_CS;
-    slot_config.host_id = SPI2_HOST;
-
-    esp_err_t ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host_config, &slot_config, &mount_config, &card);
-    if (ret == ESP_OK) scan_sd_mp3_files();
-    return ret;
-}
-
-static FILE* open_mp3_track_file(int track_num) {
-    if (s_total_tracks > 0) {
-        int index = (track_num - 1) % s_total_tracks;
-        if (index < 0) index = 0;
-        if (s_track_list[index]) {
-            FILE *f = fopen(s_track_list[index], "rb");
-            if (f) return f;
-        }
-    }
-    char filepath[MAX_PATH_LEN];
-    snprintf(filepath, sizeof(filepath), MOUNT_POINT "/music%d.mp3", track_num);
-    FILE *f = fopen(filepath, "rb");
-    if (!f && track_num != 1) f = fopen(MOUNT_POINT "/music1.mp3", "rb");
-    return f;
 }
 
 static void mp3_player_task(void *pvParameters) {
@@ -660,9 +707,12 @@ static void mp3_player_task(void *pvParameters) {
 
     uint8_t *file_buf = malloc(FILE_BUF_SIZE);
     int16_t *pcm_buf = malloc(PCM_BUF_SIZE);
-    if (!file_buf || !pcm_buf) {
+    int16_t *stereo_buf = malloc(PCM_BUF_SIZE * 2); 
+    
+    if (!file_buf || !pcm_buf || !stereo_buf) {
         if (file_buf) free(file_buf);
         if (pcm_buf) free(pcm_buf);
+        if (stereo_buf) free(stereo_buf);
         MP3FreeDecoder(hMP3Decoder);
         vTaskDelete(NULL);
     }
@@ -670,11 +720,6 @@ static void mp3_player_task(void *pvParameters) {
     uint32_t last_eq_send_time = 0;
     int current_playing_track = s_target_track;
     FILE *f = open_mp3_track_file(current_playing_track);
-    if (!f) {
-        free(file_buf); free(pcm_buf);
-        MP3FreeDecoder(hMP3Decoder);
-        vTaskDelete(NULL);
-    }
 
     int bytes_in_buffer = 0;
     uint8_t *read_ptr = file_buf;
@@ -694,7 +739,7 @@ static void mp3_player_task(void *pvParameters) {
             continue;
         }
 
-        if (bytes_in_buffer < 1024) {
+        if (bytes_in_buffer < 1024 && f != NULL) {
             memmove(file_buf, read_ptr, bytes_in_buffer);
             int bytes_read = fread(file_buf + bytes_in_buffer, 1, FILE_BUF_SIZE - bytes_in_buffer, f);
             if (bytes_read <= 0 && bytes_in_buffer == 0) {
@@ -723,16 +768,12 @@ static void mp3_player_task(void *pvParameters) {
         if (err == ERR_MP3_NONE) {
             MP3FrameInfo frameInfo;
             MP3GetLastFrameInfo(hMP3Decoder, &frameInfo);
-            
-            if (frameInfo.samprate != s_current_sample_rate && frameInfo.samprate > 0) {
-                set_i2s_sample_rate(frameInfo.samprate);
-            }
 
             int sample_count = frameInfo.outputSamps;
-            int pcm_bytes = sample_count * sizeof(int16_t);
+            int channels = frameInfo.nChans;
 
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (!s_voice_call_mode && s_music_playing && (now - last_eq_send_time >= 40)) {
+            if (s_music_playing && (now - last_eq_send_time >= 40)) {
                 last_eq_send_time = now;
                 int bands[8] = {0};
                 int samples_per_band = sample_count / 8;
@@ -754,28 +795,73 @@ static void mp3_player_task(void *pvParameters) {
                 pcm_buf[i] = (int16_t)(scaled > 32767 ? 32767 : (scaled < -32768 ? -32768 : scaled));
             }
 
-            size_t bytes_written = 0;
-            i2s_channel_write(s_tx_chan, pcm_buf, pcm_bytes, &bytes_written, portMAX_DELAY);
+            if (xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                if (!s_voice_call_mode && frameInfo.samprate > 0) {
+                    set_i2s_sample_rate_locked(frameInfo.samprate); 
+                    size_t bytes_written = 0;
+
+                    if (channels == 1) {
+                        for (int i = 0; i < sample_count; i++) {
+                            stereo_buf[i * 2] = pcm_buf[i];
+                            stereo_buf[i * 2 + 1] = pcm_buf[i];
+                        }
+                        i2s_channel_write(s_tx_chan, stereo_buf, sample_count * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+                    } else {
+                        i2s_channel_write(s_tx_chan, pcm_buf, sample_count * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+                    }
+                }
+                xSemaphoreGive(s_i2s_mutex);
+            }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(1);
         }
     }
+}
 
-    if (f) fclose(f);
-    MP3FreeDecoder(hMP3Decoder);
-    free(file_buf); free(pcm_buf);
-    vTaskDelete(NULL);
+static esp_err_t init_i2s_driver(void) {
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 8;
+    chan_cfg.dma_frame_num = 256;
+    chan_cfg.auto_clear = true;
+
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100), 
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED, .bclk = I2S_BCLK_PIN, .ws = I2S_LRCK_PIN, .dout = I2S_DOUT_PIN, .din = I2S_GPIO_UNUSED,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    
+    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
+
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
+    return ESP_OK;
+}
+
+static void init_p4_uarts(void) {
+    uart_config_t uart_ctrl_cfg = {
+        .baud_rate = 115200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(P4_UART_NUM, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(P4_UART_NUM, &uart_ctrl_cfg));
+    ESP_ERROR_CHECK(uart_set_pin(P4_UART_NUM, P4_TX_PIN, P4_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 }
 
 static void system_init_task(void *pvParameters) {
-    ESP_LOGI(TAG, "🚀 WROOM 메인 초기화 워커 태스크 시작 (12KB 스택)");
+    ESP_LOGI(TAG, "🚀 WROOM 메인 초기화 워커 태스크 시작");
 
     s_c2_dec = codec2_create(CODEC2_MODE_2400);
     if (!s_c2_dec) {
         ESP_LOGE(TAG, "❌ Codec2 디코더 생성 실패!");
-    } else {
-        ESP_LOGI(TAG, "✅ Codec2 2400bps 디코더 생성 완료");
     }
+
+    // [수정] 큐 크기를 5로 축소하여 과거 소리가 쌓이는 딜레이 완벽 차단
+    s_voice_queue = xQueueCreate(5, sizeof(voice_downlink_msg_t));
 
     nimble_port_init();
     ble_svc_gap_device_name_set("ESP32_WROOM_RECV");
@@ -785,12 +871,13 @@ static void system_init_task(void *pvParameters) {
     init_p4_uarts();
     ESP_ERROR_CHECK(init_i2s_driver());
 
-    xTaskCreatePinnedToCore(p4_rx_task, "p4_rx_task", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(p4_rx_task, "p4_rx_task", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(voice_play_worker_task, "voice_play_task", 24576, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(radar_process_task, "radar_process_task", 3072, NULL, 4, NULL, 0);
 
     if (init_sd_card() == ESP_OK) {
         ESP_LOGI(TAG, "💾 SD 카드 마운트 성공! (%d곡 로드)", s_total_tracks);
-        xTaskCreatePinnedToCore(mp3_player_task, "mp3_player_task", 8192, NULL, 5, NULL, 1);
+        xTaskCreatePinnedToCore(mp3_player_task, "mp3_player_task", 8192, NULL, 4, NULL, 1);
     } else {
         ESP_LOGW(TAG, "⚠️ SD 카드가 없거나 마운트에 실패했습니다.");
     }
@@ -809,6 +896,7 @@ void app_main(void) {
 
     s_sensor_mutex = xSemaphoreCreateMutex();
     s_uart_tx_mutex = xSemaphoreCreateMutex();
+    s_i2s_mutex = xSemaphoreCreateMutex();
 
     xTaskCreatePinnedToCore(system_init_task, "sys_init_task", 12288, NULL, 5, NULL, 0);
 }
