@@ -52,11 +52,11 @@ static char *s_track_list[MAX_TRACKS] = {NULL};
 static int s_total_tracks = 0;
 
 static volatile bool s_music_playing = false; 
-static volatile float s_volume_factor = 0.2f;
+static volatile float s_volume_factor = 0.04f; // 20% 지수형 시작 (0.2 * 0.2)
 static volatile int s_current_volume = 20;        
 static volatile int s_play_mode = 0;             
 static volatile int s_target_track = 1;          
-static volatile bool s_track_changed = false;     
+static volatile bool s_track_changed = false;    
 static volatile bool s_voice_call_mode = false;
 static volatile bool s_ble_connected = false;
 
@@ -68,7 +68,7 @@ static struct CODEC2 *s_c2_dec = NULL;
 #define PIN_NUM_CS          5
 #define MOUNT_POINT         "/sdcard"
 
-#define FILE_BUF_SIZE       (2 * 1024)
+#define FILE_BUF_SIZE       (8 * 1024)
 #define PCM_BUF_SIZE        (1152 * 2 * sizeof(int16_t))
 
 typedef struct {
@@ -129,7 +129,6 @@ static volatile uint32_t s_rx_em_cnt = 0;
 static volatile uint32_t s_rx_audio_cnt = 0;
 static uint32_t s_emergency_trigger_time = 0;
 
-// [추가] 스피커가 물리적으로 재생 중임을 나타내는 최신 재생 시각 타이머
 static volatile uint32_t s_last_play_time = 0; 
 
 static void p4_uart_send_bytes(const void *data, size_t len) {
@@ -143,11 +142,11 @@ static void set_i2s_sample_rate_locked(uint32_t rate) {
     if (s_current_sample_rate != rate && s_tx_chan != NULL) {
         i2s_channel_disable(s_tx_chan);
         i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
-        clk_cfg.clk_src = I2S_CLK_SRC_APLL; 
+        clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT; 
         i2s_channel_reconfig_std_clock(s_tx_chan, &clk_cfg);
         i2s_channel_enable(s_tx_chan);
         s_current_sample_rate = rate;
-        ESP_LOGI(TAG, "🎵 [오디오 시스템] I2S DAC 샘플레이트 전환: %lu Hz (APLL)", rate);
+        ESP_LOGI(TAG, "🎵 [I2S DAC] 샘플레이트 변경: %lu Hz", rate);
     }
 }
 
@@ -167,12 +166,9 @@ static void parse_ld2450_frame(const uint8_t *data, uint16_t len, int16_t out_x[
         int16_t y = (raw_y & 0x8000) ? -(int16_t)(raw_y & 0x7FFF) : (int16_t)raw_y;
 
         if (abs(y) > 100 || abs(x) > 100 || res > 0) {
-            out_x[i] = x;
-            out_y[i] = y;
-            detected = true;
+            out_x[i] = x; out_y[i] = y; detected = true;
         } else {
-            out_x[i] = 0;
-            out_y[i] = 0;
+            out_x[i] = 0; out_y[i] = 0;
         }
     }
     *out_detected = detected ? 1 : 0;
@@ -305,7 +301,12 @@ static void ble_client_scan(void) {
     if (ble_hs_id_infer_auto(0, &own_addr_type) != 0) return;
 
     struct ble_gap_disc_params disc_params = {
-        .filter_duplicates = 1, .passive = 0, .itvl = 0x0040, .window = 0x0030, .filter_policy = 0, .limited = 0
+        .filter_duplicates = 1, 
+        .passive = 1,
+        .itvl = 0x0100,
+        .window = 0x0080,
+        .filter_policy = 0, 
+        .limited = 0
     };
     ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
 }
@@ -330,7 +331,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             }
 
             if (is_match) {
-                ESP_LOGW(TAG, "🎯 [S3 감지] 이름:[%s] -> BLE 연결!", dev_name);
                 ble_gap_disc_cancel();
                 uint8_t own_addr_type;
                 ble_hs_id_infer_auto(0, &own_addr_type);
@@ -396,12 +396,8 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             s_rx_audio_cnt++;
             if (s_voice_call_mode && pkt_len > 0) {
                 uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                bool is_speaker_busy = (uxQueueMessagesWaiting(s_voice_queue) > 0) || (now - s_last_play_time < 350);
                 
-                // [정답 로직] 큐에 대기 중인 오디오가 있거나, 마지막 스피커 재생 후 0.8초가 안 지났다면 
-                // 스피커가 울리는 중이므로 현장 마이크를 닫아 에코(하울링)를 막습니다.
-                bool is_speaker_busy = (uxQueueMessagesWaiting(s_voice_queue) > 0) || (now - s_last_play_time < 800);
-                
-                // 스피커가 완벽하게 조용할 때만 현장 소리를 올려보냄
                 if (!is_speaker_busy) {
                     uint8_t voice_pkt[64];
                     voice_pkt[0] = 0xA5; voice_pkt[1] = 0x5A; voice_pkt[2] = (uint8_t)pkt_len;
@@ -442,8 +438,7 @@ static void ble_host_task(void *param) {
 }
 
 static void radar_process_task(void *pvParameters) {
-    int prev_primary_y = 0;
-    int tracking_state = 0;
+    bool prev_slot_active[3] = {false, false, false};
     uint8_t tx_frame[34];
 
     while (1) {
@@ -460,26 +455,14 @@ static void radar_process_task(void *pvParameters) {
                 s_p4_pkt.emergency_code = 0;
             }
 
-            int primary_y = 0;
-            if (s_p4_pkt.r1_detected) {
-                for (int i = 0; i < 3; i++) {
-                    if (s_p4_pkt.r1_y[i] != 0) { primary_y = abs(s_p4_pkt.r1_y[i]); break; }
+            for (int i = 0; i < 3; i++) {
+                bool curr_active = (s_p4_pkt.r1_x[i] != 0 || s_p4_pkt.r1_y[i] != 0);
+                if (curr_active && !prev_slot_active[i]) {
+                    s_p4_pkt.in_count++;
                 }
+                prev_slot_active[i] = curr_active;
             }
 
-            if (primary_y > 0) {
-                if (prev_primary_y > 0) {
-                    int delta = primary_y - prev_primary_y;
-                    if (delta < -250 && tracking_state == 0) tracking_state = 1;
-                    else if (delta > 250 && tracking_state == 0) tracking_state = 2;
-
-                    if (tracking_state == 1 && primary_y < 800) { s_p4_pkt.in_count++; tracking_state = 0; }
-                    else if (tracking_state == 2 && primary_y > 2500) { s_p4_pkt.out_count++; tracking_state = 0; }
-                }
-                prev_primary_y = primary_y;
-            } else {
-                tracking_state = 0; prev_primary_y = 0;
-            }
             snap = s_p4_pkt;
             xSemaphoreGive(s_sensor_mutex);
         }
@@ -509,68 +492,6 @@ static void radar_process_task(void *pvParameters) {
     }
 }
 
-// =============================================================================
-// [수정] 오디오 재생 워커 - 즉시 재생 및 재생 시간 타이머 기록
-// =============================================================================
-static int16_t s_voice_pcm_8k[160];
-static int16_t s_voice_stereo_8k[160 * 2];
-
-static void voice_play_worker_task(void *pvParameters) {
-    voice_downlink_msg_t msg;
-
-    while (1) {
-        if (!s_voice_call_mode) {
-            xQueueReset(s_voice_queue);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-
-        if (xQueueReceive(s_voice_queue, &msg, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (s_c2_dec != NULL && msg.len > 0) {
-                
-                s_last_play_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                
-                if (xSemaphoreTake(s_i2s_mutex, portMAX_DELAY) == pdTRUE) {
-                    set_i2s_sample_rate_locked(8000);
-
-                    for (int c_idx = 0; c_idx < msg.len; c_idx += 6) {
-                        if (msg.len - c_idx < 6) break;
-
-                        codec2_decode(s_c2_dec, s_voice_pcm_8k, &msg.data[c_idx]);
-
-                        for (int s = 0; s < 160; s++) {
-                            // ----------------------------------------------------
-                            // [볼륨 조절 부분] 곱하기와 나누기를 통해 원하는 %로 맞춥니다.
-                            // 예: 원본의 50% 볼륨 -> * 5 / 10
-                            // 예: 원본의 30% 볼륨 -> * 3 / 10
-                            // 예: 원본의 70% 볼륨 -> * 7 / 10
-                            // ----------------------------------------------------
-                            int32_t val = ((int32_t)s_voice_pcm_8k[s] * 1) / 10; 
-                            
-                            if (val > 32767) val = 32767;
-                            if (val < -32768) val = -32768;
-                            s_voice_stereo_8k[s * 2]     = (int16_t)val;
-                            s_voice_stereo_8k[s * 2 + 1] = (int16_t)val;
-                        }
-
-                        size_t written = 0;
-                        i2s_channel_write(s_tx_chan, s_voice_stereo_8k, sizeof(s_voice_stereo_8k), &written, portMAX_DELAY);
-                    }
-                    xSemaphoreGive(s_i2s_mutex);
-                }
-            }
-        } else {
-            // 소리가 없을 때는 스피커 무음 처리
-            if (xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                set_i2s_sample_rate_locked(8000);
-                memset(s_voice_stereo_8k, 0, sizeof(s_voice_stereo_8k));
-                size_t written = 0;
-                i2s_channel_write(s_tx_chan, s_voice_stereo_8k, sizeof(s_voice_stereo_8k), &written, pdMS_TO_TICKS(5));
-                xSemaphoreGive(s_i2s_mutex);
-            }
-        }
-    }
-}
 static uint8_t s_rx_acc_buf[512];
 static int s_rx_acc_len = 0;
 static uint8_t s_uart_temp[128];
@@ -582,7 +503,7 @@ static void p4_rx_task(void *pvParameters) {
     while (1) {
         int len = uart_read_bytes(P4_UART_NUM, s_uart_temp, sizeof(s_uart_temp), pdMS_TO_TICKS(5));
         if (len > 0) {
-            if (s_rx_acc_len + len < (int)sizeof(s_rx_acc_buf)) {
+            if (s_rx_acc_len + len <= (int)sizeof(s_rx_acc_buf)) {
                 memcpy(&s_rx_acc_buf[s_rx_acc_len], s_uart_temp, len);
                 s_rx_acc_len += len;
             } else {
@@ -594,103 +515,99 @@ static void p4_rx_task(void *pvParameters) {
             for (int i = 0; i <= s_rx_acc_len - 9; i++) {
                 if (memcmp(&s_rx_acc_buf[i], "$CALL_END", 9) == 0) {
                     s_voice_call_mode = false;
-                    xQueueReset(s_voice_queue); 
-
-                    if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                        s_p4_pkt.emergency_code = 0;
-                        xSemaphoreGive(s_sensor_mutex);
-                    }
-
+                    xQueueReset(s_voice_queue);
                     if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
-                        const char *end_cmd = "CALL_END";
-                        for (int k = 0; k < 5; k++) {
-                            ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, end_cmd, strlen(end_cmd));
-                            vTaskDelay(pdMS_TO_TICKS(5));
-                        }
+                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, "CALL_END", 8);
                     }
-                    s_rx_acc_len = 0; 
-                    ESP_LOGW(TAG, "🔴 [통화 종료] 통화 기능 정지 및 큐 초기화");
-                    break;
+                    s_rx_acc_len = 0; break;
+                }
+            }
+        }
+        if (s_rx_acc_len >= 11) {
+            for (int i = 0; i <= s_rx_acc_len - 11; i++) {
+                if (memcmp(&s_rx_acc_buf[i], "$CALL_START", 11) == 0) {
+                    s_voice_call_mode = true; s_music_playing = false; xQueueReset(s_voice_queue);
+                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
+                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, "CALL_START", 10);
+                    }
+                    s_rx_acc_len = 0; break;
                 }
             }
         }
 
         while (s_rx_acc_len > 0) {
-            if (s_rx_acc_len >= 3 && s_rx_acc_buf[0] == 0x5A && s_rx_acc_buf[1] == 0xA5) {
+            if (s_rx_acc_buf[0] == 0x5A) {
+                if (s_rx_acc_len < 3) break; 
+                if (s_rx_acc_buf[1] != 0xA5) {
+                    s_rx_acc_len--; memmove(s_rx_acc_buf, &s_rx_acc_buf[1], s_rx_acc_len); continue;
+                }
+                
                 uint8_t c2_len = s_rx_acc_buf[2];
-                if (s_rx_acc_len >= 3 + c2_len) {
-                    if (s_voice_call_mode && c2_len <= sizeof(((voice_downlink_msg_t*)0)->data)) {
-                        voice_downlink_msg_t msg;
-                        msg.len = c2_len;
-                        memcpy(msg.data, &s_rx_acc_buf[3], c2_len);
-                        
-                        // [수정] 큐가 꽉 차면 밀린 과거 소리를 버리고 새로운 최신 소리를 즉시 수신
-                        if (uxQueueSpacesAvailable(s_voice_queue) == 0) {
-                            voice_downlink_msg_t dummy;
-                            xQueueReceive(s_voice_queue, &dummy, 0); 
-                        }
-                        xQueueSend(s_voice_queue, &msg, 0);
+                if (s_rx_acc_len < 3 + c2_len) break; 
+
+                if (s_voice_call_mode && c2_len <= 64) {
+                    voice_downlink_msg_t msg;
+                    msg.len = c2_len;
+                    memcpy(msg.data, &s_rx_acc_buf[3], c2_len);
+                    if (uxQueueSpacesAvailable(s_voice_queue) == 0) {
+                        voice_downlink_msg_t dummy; xQueueReceive(s_voice_queue, &dummy, 0); 
                     }
-                    s_rx_acc_len -= (3 + c2_len);
-                    if (s_rx_acc_len > 0) memmove(s_rx_acc_buf, &s_rx_acc_buf[3 + c2_len], s_rx_acc_len);
-                    continue;
-                } else {
+                    xQueueSend(s_voice_queue, &msg, 0);
+                }
+                s_rx_acc_len -= (3 + c2_len);
+                if (s_rx_acc_len > 0) memmove(s_rx_acc_buf, &s_rx_acc_buf[3 + c2_len], s_rx_acc_len);
+                continue;
+            } 
+            else if (s_rx_acc_buf[0] == '$') {
+                int nl_idx = -1;
+                for (int j = 1; j < s_rx_acc_len; j++) {
+                    if (s_rx_acc_buf[j] == '\n' || s_rx_acc_buf[j] == '\r') { nl_idx = j; break; }
+                }
+                if (nl_idx == -1) {
+                    if (s_rx_acc_len >= (int)sizeof(s_rx_acc_buf)) { 
+                        s_rx_acc_len--; memmove(s_rx_acc_buf, &s_rx_acc_buf[1], s_rx_acc_len); continue; 
+                    }
                     break;
                 }
-            }
 
-            int nl_idx = -1;
-            for (int j = 0; j < s_rx_acc_len; j++) {
-                if (s_rx_acc_buf[j] == '\n' || s_rx_acc_buf[j] == '\r') {
-                    nl_idx = j; break;
+                int copy_len = (nl_idx < (int)sizeof(s_line_buf) - 1) ? nl_idx : (int)sizeof(s_line_buf) - 1;
+                memcpy(s_line_buf, s_rx_acc_buf, copy_len); s_line_buf[copy_len] = '\0';
+
+                if (strstr(s_line_buf, "MUSIC,ON") != NULL) { if (!s_voice_call_mode) s_music_playing = true; } 
+                else if (strstr(s_line_buf, "MUSIC,OFF") != NULL) s_music_playing = false;
+                else if (strncmp(s_line_buf, "$VOL,", 5) == 0) {
+                    int vol = atoi(s_line_buf + 5);
+                    s_current_volume = (vol < 0) ? 0 : ((vol > 100) ? 100 : vol);
+                    float ratio = (float)s_current_volume / 100.0f;
+                    s_volume_factor = ratio * ratio; 
                 }
-            }
-
-            if (nl_idx != -1) {
-                int copy_len = nl_idx < (int)sizeof(s_line_buf) - 1 ? nl_idx : (int)sizeof(s_line_buf) - 1;
-                memcpy(s_line_buf, s_rx_acc_buf, copy_len);
-                s_line_buf[copy_len] = '\0';
-
-                if (strstr(s_line_buf, "$CALL_START") != NULL) {
-                    s_voice_call_mode = true;
-                    s_music_playing = false;
-                    xQueueReset(s_voice_queue);
-                    ESP_LOGW(TAG, "🚨 [통화 시작] 음악/레이더 정지 (마이크만 활성)");
-
-                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
-                        const char *start_cmd = "CALL_START";
-                        for (int k = 0; k < 5; k++) {
-                            ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, start_cmd, strlen(start_cmd));
-                            vTaskDelay(pdMS_TO_TICKS(5));
-                        }
-                        ESP_LOGI(TAG, "📡 [BLE TX] S3로 CALL_START 전송 완료! (마이크 On)");
+                else if (strncmp(s_line_buf, "$PLAYMODE,", 10) == 0) {
+                    s_play_mode = atoi(s_line_buf + 10);
+                }
+                else if (strncmp(s_line_buf, "$TRACK,", 7) == 0) {
+                    int trk = atoi(s_line_buf + 7);
+                    if (trk > 0 && s_target_track != trk) {
+                        s_target_track = trk; s_play_mode = 2; s_track_changed = true; s_music_playing = true; 
                     }
                 }
-                else if (strstr(s_line_buf, "$MUSIC,ON") != NULL) {
-                    if (!s_voice_call_mode) s_music_playing = true;
-                    p4_uart_send_bytes("$MUSIC,ACK\n", 11);
-                } else if (strstr(s_line_buf, "$MUSIC,OFF") != NULL) {
-                    s_music_playing = false;
-                    p4_uart_send_bytes("$MUSIC,OFF_ACK\n", 15);
-                } else if (strstr(s_line_buf, "$CTRL,") != NULL) {
-                    int vol = 50, mode = 0, track = 1;
-                    if (sscanf(s_line_buf, "$CTRL,%d,%d,%d", &vol, &mode, &track) == 3) {
-                        if (vol < 0) vol = 0;
-                        if (vol > 100) vol = 100;
-                        s_current_volume = vol;
-                        float ratio = (float)vol / 100.0f;
-                        s_volume_factor = ratio * ratio;
-                        s_play_mode = mode;
-                        if (mode == 2 && track > 0 && s_target_track != track) {
-                            s_target_track = track;
-                            s_track_changed = true; 
-                        }
-                        p4_uart_send_bytes("$CTRL_ACK\n", 10);
-                    }
+                else if (strncmp(s_line_buf, "$ACTION,NEXT", 12) == 0) {
+                    if (s_total_tracks > 0) s_target_track = (s_target_track % s_total_tracks) + 1;
+                    else s_target_track++;
+                    s_track_changed = true; s_music_playing = true;
+                }
+                else if (strncmp(s_line_buf, "$ACTION,PREV", 12) == 0) {
+                    if (s_total_tracks > 0) s_target_track = (s_target_track <= 1) ? s_total_tracks : (s_target_track - 1);
+                    else if (s_target_track > 1) s_target_track--;
+                    s_track_changed = true; s_music_playing = true;
                 }
 
                 s_rx_acc_len -= (nl_idx + 1);
                 if (s_rx_acc_len > 0) memmove(s_rx_acc_buf, &s_rx_acc_buf[nl_idx + 1], s_rx_acc_len);
+                continue;
+            }
+            else if (s_rx_acc_buf[0] == '\n' || s_rx_acc_buf[0] == '\r') {
+                s_rx_acc_len--;
+                if (s_rx_acc_len > 0) memmove(s_rx_acc_buf, &s_rx_acc_buf[1], s_rx_acc_len);
                 continue;
             }
 
@@ -700,6 +617,73 @@ static void p4_rx_task(void *pvParameters) {
         vTaskDelay(1);
     }
 }
+
+static int16_t s_voice_pcm_8k[160];
+static int16_t s_voice_stereo_8k[160 * 2];
+
+static void voice_play_worker_task(void *pvParameters) {
+    voice_downlink_msg_t msg;
+    bool is_buffering = true;
+    int silence_count = 0;
+
+    while (1) {
+        if (!s_voice_call_mode) {
+            xQueueReset(s_voice_queue);
+            is_buffering = true; silence_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (is_buffering) {
+            if (uxQueueMessagesWaiting(s_voice_queue) >= 2 || (silence_count > 15 && uxQueueMessagesWaiting(s_voice_queue) > 0)) {
+                is_buffering = false; silence_count = 0;
+            } else {
+                silence_count++; vTaskDelay(pdMS_TO_TICKS(10)); continue;
+            }
+        }
+
+        if (xQueueReceive(s_voice_queue, &msg, pdMS_TO_TICKS(150)) == pdTRUE) {
+            silence_count = 0;
+            if (s_c2_dec != NULL && msg.len > 0) {
+                s_last_play_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                
+                if (xSemaphoreTake(s_i2s_mutex, portMAX_DELAY) == pdTRUE) {
+                    set_i2s_sample_rate_locked(8000);
+                    for (int c_idx = 0; c_idx < msg.len; c_idx += 6) {
+                        if (msg.len - c_idx < 6) break;
+                        codec2_decode(s_c2_dec, s_voice_pcm_8k, &msg.data[c_idx]);
+
+                        for (int s = 0; s < 160; s++) {
+                            int32_t val = (int32_t)(s_voice_pcm_8k[s] * s_volume_factor * 3.0f); 
+                            if (val > 32767) val = 32767;
+                            if (val < -32768) val = -32768;
+                            s_voice_stereo_8k[s * 2]     = (int16_t)val;
+                            s_voice_stereo_8k[s * 2 + 1] = (int16_t)val;
+                        }
+                        size_t written = 0;
+                        i2s_channel_write(s_tx_chan, s_voice_stereo_8k, sizeof(s_voice_stereo_8k), &written, portMAX_DELAY);
+                    }
+                    xSemaphoreGive(s_i2s_mutex);
+                }
+            }
+        } else {
+            silence_count++;
+            if (silence_count >= 2) {
+                if (xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    set_i2s_sample_rate_locked(8000);
+                    memset(s_voice_stereo_8k, 0, sizeof(s_voice_stereo_8k));
+                    size_t written = 0;
+                    i2s_channel_write(s_tx_chan, s_voice_stereo_8k, sizeof(s_voice_stereo_8k), &written, pdMS_TO_TICKS(10));
+                    xSemaphoreGive(s_i2s_mutex);
+                }
+                is_buffering = true;
+            }
+        }
+    }
+}
+
+// 💡 [따발총/경운기 소리 완전 해결] 대기 시 지속 전송할 1024바이트 무음 버퍼
+static int16_t s_idle_zero_buf[512] = {0}; 
 
 static void mp3_player_task(void *pvParameters) {
     HMP3Decoder hMP3Decoder = MP3InitDecoder();
@@ -734,14 +718,27 @@ static void mp3_player_task(void *pvParameters) {
             read_ptr = file_buf;
         }
 
+        // 💡 [핵심 수정] portMAX_DELAY를 사용하여 DMA 버퍼 빈자리에 맞춰 실시간 블로킹 전송 (vTaskDelay 제거)
         if (s_voice_call_mode || !s_music_playing) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+            if (!s_voice_call_mode) {
+                if (xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    set_i2s_sample_rate_locked(44100);
+                    size_t bytes_written = 0;
+                    i2s_channel_write(s_tx_chan, s_idle_zero_buf, sizeof(s_idle_zero_buf), &bytes_written, portMAX_DELAY);
+                    xSemaphoreGive(s_i2s_mutex);
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
             continue;
         }
 
-        if (bytes_in_buffer < 1024 && f != NULL) {
+        if (bytes_in_buffer < 2048 && f != NULL) {
             memmove(file_buf, read_ptr, bytes_in_buffer);
             int bytes_read = fread(file_buf + bytes_in_buffer, 1, FILE_BUF_SIZE - bytes_in_buffer, f);
+            
             if (bytes_read <= 0 && bytes_in_buffer == 0) {
                 if (s_play_mode == 0 || s_play_mode == 1) { 
                     int count = (s_total_tracks > 0) ? s_total_tracks : 5;
@@ -752,14 +749,24 @@ static void mp3_player_task(void *pvParameters) {
                 }
                 bytes_in_buffer = 0;
                 read_ptr = file_buf;
+                vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
             bytes_in_buffer += bytes_read;
             read_ptr = file_buf;
         }
 
+        if (bytes_in_buffer == 0 || f == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         int offset = MP3FindSyncWord(read_ptr, bytes_in_buffer);
-        if (offset < 0) { bytes_in_buffer = 0; continue; }
+        if (offset < 0) { 
+            bytes_in_buffer = 0; 
+            vTaskDelay(pdMS_TO_TICKS(10)); 
+            continue; 
+        }
 
         read_ptr += offset;
         bytes_in_buffer -= offset;
@@ -820,8 +827,8 @@ static void mp3_player_task(void *pvParameters) {
 
 static esp_err_t init_i2s_driver(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 256;
+    chan_cfg.dma_desc_num = 16;
+    chan_cfg.dma_frame_num = 512;
     chan_cfg.auto_clear = true;
 
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx_chan, NULL));
@@ -830,12 +837,16 @@ static esp_err_t init_i2s_driver(void) {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100), 
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED, .bclk = I2S_BCLK_PIN, .ws = I2S_LRCK_PIN, .dout = I2S_DOUT_PIN, .din = I2S_GPIO_UNUSED,
+            .mclk = I2S_GPIO_UNUSED, 
+            .bclk = I2S_BCLK_PIN, 
+            .ws = I2S_LRCK_PIN, 
+            .dout = I2S_DOUT_PIN, 
+            .din = I2S_GPIO_UNUSED,
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
     
-    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
+    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
@@ -860,8 +871,7 @@ static void system_init_task(void *pvParameters) {
         ESP_LOGE(TAG, "❌ Codec2 디코더 생성 실패!");
     }
 
-    // [수정] 큐 크기를 5로 축소하여 과거 소리가 쌓이는 딜레이 완벽 차단
-    s_voice_queue = xQueueCreate(5, sizeof(voice_downlink_msg_t));
+    s_voice_queue = xQueueCreate(30, sizeof(voice_downlink_msg_t));
 
     nimble_port_init();
     ble_svc_gap_device_name_set("ESP32_WROOM_RECV");
