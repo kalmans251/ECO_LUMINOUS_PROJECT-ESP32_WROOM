@@ -33,9 +33,9 @@
 
 #define TAG "WROOM_BLE"
 
-#define I2S_BCLK_PIN        27
+#define I2S_BCLK_PIN        32
 #define I2S_LRCK_PIN        33
-#define I2S_DOUT_PIN        32
+#define I2S_DOUT_PIN        27
 
 static i2s_chan_handle_t    s_tx_chan = NULL;
 static SemaphoreHandle_t    s_i2s_mutex = NULL;
@@ -52,13 +52,20 @@ static char *s_track_list[MAX_TRACKS] = {NULL};
 static int s_total_tracks = 0;
 
 static volatile bool s_music_playing = false; 
-static volatile float s_volume_factor = 0.04f; // 20% 지수형 시작 (0.2 * 0.2)
+static volatile float s_volume_factor = 0.04f;
 static volatile int s_current_volume = 20;        
 static volatile int s_play_mode = 0;             
 static volatile int s_target_track = 1;          
 static volatile bool s_track_changed = false;    
+
+// 🚨 비상 사이렌, 음성 통화 및 비상벨 기능 플래그
+static volatile bool s_is_siren_sounding = false;
 static volatile bool s_voice_call_mode = false;
+static volatile bool s_alarm_enabled = true;
 static volatile bool s_ble_connected = false;
+
+// 🔄 인원수 0 리셋 플래그
+static volatile bool s_req_count_reset = false;
 
 static struct CODEC2 *s_c2_dec = NULL;
 
@@ -127,9 +134,11 @@ static volatile uint32_t s_rx_r1_cnt = 0;
 static volatile uint32_t s_rx_r2_cnt = 0;
 static volatile uint32_t s_rx_em_cnt = 0;
 static volatile uint32_t s_rx_audio_cnt = 0;
-static uint32_t s_emergency_trigger_time = 0;
 
 static volatile uint32_t s_last_play_time = 0; 
+
+// [수정] 44.1kHz 스테레오 기준 약 23ms 분량의 넉넉한 무음 버퍼 확보 (1024 샘플)
+static int16_t s_idle_zero_buf[1024 * 2] = {0}; 
 
 static void p4_uart_send_bytes(const void *data, size_t len) {
     if (s_uart_tx_mutex && xSemaphoreTake(s_uart_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -188,7 +197,7 @@ static void scan_sd_mp3_files(void) {
     while ((entry = readdir(dir)) != NULL && s_total_tracks < MAX_TRACKS) {
         if (entry->d_type == DT_REG || entry->d_type == DT_UNKNOWN) {
             char *ext = strrchr(entry->d_name, '.');
-            if (ext && (strcasecmp(ext, ".mp3") == 0)) {
+            if (ext && (strcasecmp(ext, ".mp3") == 0) && (strcasecmp(entry->d_name, "emg.mp3") != 0)) {
                 snprintf(path_buf, sizeof(path_buf), "%s/%s", MOUNT_POINT, entry->d_name);
                 s_track_list[s_total_tracks++] = strdup(path_buf);
             }
@@ -374,18 +383,24 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 
             if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 s_rx_em_cnt++;
-                if (strstr(msg, "살려") != NULL) s_p4_pkt.emergency_code = 1;
-                else if (strstr(msg, "도와") != NULL) s_p4_pkt.emergency_code = 2;
-                else if (strstr(msg, "구해") != NULL) s_p4_pkt.emergency_code = 3;
-                else if (strstr(msg, "CALL_START") != NULL) s_p4_pkt.emergency_code = 1;
-                else if (strstr(msg, "CALL_END") != NULL) s_p4_pkt.emergency_code = 0;
-
-                if (s_p4_pkt.emergency_code > 0) {
-                    s_emergency_trigger_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                    s_voice_call_mode = true;
-                    s_music_playing = false;
-                    p4_uart_send_bytes("$CALL_START\n", 12);
-                } else {
+                
+                if (s_alarm_enabled && (strstr(msg, "CALL_START") != NULL || strstr(msg, "EMERGENCY") != NULL || 
+                    strstr(msg, "살려") != NULL || strstr(msg, "도와") != NULL || strstr(msg, "구해") != NULL)) {
+                    
+                    s_p4_pkt.emergency_code = 1;
+                    s_is_siren_sounding = true;
+                    s_voice_call_mode = false;
+                    s_music_playing = false; 
+                    
+                    // [수정] NimBLE 콜백 내 블로킹 vTaskDelay 제거 및 3회 연속 버스트 전송
+                    const char call_burst[] = "$CALL_START\n$CALL_START\n$CALL_START\n";
+                    p4_uart_send_bytes(call_burst, strlen(call_burst));
+                    
+                    ESP_LOGW(TAG, "🚨 [비상 발생] emg.mp3 재생 트리거 & P4로 $CALL_START 3회 전송");
+                } 
+                else if (strstr(msg, "CALL_END") != NULL) {
+                    s_p4_pkt.emergency_code = 0;
+                    s_is_siren_sounding = false;
                     s_voice_call_mode = false;
                     p4_uart_send_bytes("$CALL_END\n", 10);
                 }
@@ -447,12 +462,16 @@ static void radar_process_task(void *pvParameters) {
             continue;
         }
 
-        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         wroom_to_p4_pkt_t snap;
-
         if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (s_p4_pkt.emergency_code > 0 && (now - s_emergency_trigger_time > 3000)) {
-                s_p4_pkt.emergency_code = 0;
+            if (s_req_count_reset) {
+                s_p4_pkt.in_count = 0;
+                s_p4_pkt.out_count = 0;
+                prev_slot_active[0] = false;
+                prev_slot_active[1] = false;
+                prev_slot_active[2] = false;
+                s_req_count_reset = false;
+                ESP_LOGW(TAG, "🔄 [인원수 0 초기화 완료] in_count & out_count = 0");
             }
 
             for (int i = 0; i < 3; i++) {
@@ -481,7 +500,9 @@ static void radar_process_task(void *pvParameters) {
             tx_frame[24 + (i * 2)]  = (uint8_t)((snap.r2_y[i] >> 8) & 0xFF);
             tx_frame[25 + (i * 2)]  = (uint8_t)(snap.r2_y[i] & 0xFF);
         }
-        tx_frame[30] = snap.r1_detected; tx_frame[31] = snap.r2_detected; tx_frame[32] = snap.emergency_code;
+        tx_frame[30] = snap.r1_detected; 
+        tx_frame[31] = snap.r2_detected; 
+        tx_frame[32] = (s_is_siren_sounding || s_voice_call_mode) ? 1 : snap.emergency_code;
 
         uint8_t chk = 0;
         for (int i = 2; i < 33; i++) chk ^= tx_frame[i];
@@ -511,26 +532,50 @@ static void p4_rx_task(void *pvParameters) {
             }
         }
 
+        // [수정] 수신 버퍼에서 일치한 길이만큼만 안전하게 memmove 처리 (연속 데이터 손실 방지)
         if (s_rx_acc_len >= 9) {
             for (int i = 0; i <= s_rx_acc_len - 9; i++) {
                 if (memcmp(&s_rx_acc_buf[i], "$CALL_END", 9) == 0) {
+                    s_is_siren_sounding = false;
                     s_voice_call_mode = false;
                     xQueueReset(s_voice_queue);
-                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
-                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, "CALL_END", 8);
+                    if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        s_p4_pkt.emergency_code = 0;
+                        xSemaphoreGive(s_sensor_mutex);
                     }
-                    s_rx_acc_len = 0; break;
+                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
+                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, (const void*)"CALL_END", 8);
+                    }
+                    ESP_LOGI(TAG, "🔇 [통화 종료] 비상 및 음성 모드 해제 완료");
+                    
+                    int remain = s_rx_acc_len - (i + 9);
+                    if (remain > 0) memmove(&s_rx_acc_buf[i], &s_rx_acc_buf[i + 9], remain);
+                    s_rx_acc_len -= 9;
+                    break;
                 }
             }
         }
+
         if (s_rx_acc_len >= 11) {
             for (int i = 0; i <= s_rx_acc_len - 11; i++) {
                 if (memcmp(&s_rx_acc_buf[i], "$CALL_START", 11) == 0) {
-                    s_voice_call_mode = true; s_music_playing = false; xQueueReset(s_voice_queue);
-                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
-                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, "CALL_START", 10);
+                    s_is_siren_sounding = false;
+                    s_voice_call_mode = true;
+                    s_music_playing = false; 
+                    xQueueReset(s_voice_queue);
+                    if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        s_p4_pkt.emergency_code = 1;
+                        xSemaphoreGive(s_sensor_mutex);
                     }
-                    s_rx_acc_len = 0; break;
+                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
+                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, (const void*)"CALL_START", 10);
+                    }
+                    ESP_LOGI(TAG, "📞 [통화 수락] emg.mp3 정지 -> 8kHz 음성 통화 연결");
+
+                    int remain = s_rx_acc_len - (i + 11);
+                    if (remain > 0) memmove(&s_rx_acc_buf[i], &s_rx_acc_buf[i + 11], remain);
+                    s_rx_acc_len -= 11;
+                    break;
                 }
             }
         }
@@ -573,7 +618,25 @@ static void p4_rx_task(void *pvParameters) {
                 int copy_len = (nl_idx < (int)sizeof(s_line_buf) - 1) ? nl_idx : (int)sizeof(s_line_buf) - 1;
                 memcpy(s_line_buf, s_rx_acc_buf, copy_len); s_line_buf[copy_len] = '\0';
 
-                if (strstr(s_line_buf, "MUSIC,ON") != NULL) { if (!s_voice_call_mode) s_music_playing = true; } 
+                if (strncmp(s_line_buf, "$RESET_CNT", 10) == 0) {
+                    s_req_count_reset = true;
+                    ESP_LOGW(TAG, "📥 [P4 수신] $RESET_CNT -> 인원수 카운트 0 초기화 요청 접수");
+                }
+                else if (strncmp(s_line_buf, "$ALARM,", 7) == 0) {
+                    int en = atoi(s_line_buf + 7);
+                    s_alarm_enabled = (en != 0);
+                    if (!s_alarm_enabled) {
+                        s_is_siren_sounding = false;
+                    }
+                }
+                else if (strncmp(s_line_buf, "$AIVOICE,", 9) == 0) {
+                    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE && g_handle_emergency != 0) {
+                        ble_gattc_write_no_rsp_flat(g_conn_handle, g_handle_emergency, (const void*)s_line_buf, strlen(s_line_buf));
+                    }
+                }
+                else if (strstr(s_line_buf, "MUSIC,ON") != NULL) { 
+                    if (!s_voice_call_mode && !s_is_siren_sounding) s_music_playing = true; 
+                } 
                 else if (strstr(s_line_buf, "MUSIC,OFF") != NULL) s_music_playing = false;
                 else if (strncmp(s_line_buf, "$VOL,", 5) == 0) {
                     int vol = atoi(s_line_buf + 5);
@@ -682,9 +745,6 @@ static void voice_play_worker_task(void *pvParameters) {
     }
 }
 
-// 💡 [따발총/경운기 소리 완전 해결] 대기 시 지속 전송할 1024바이트 무음 버퍼
-static int16_t s_idle_zero_buf[512] = {0}; 
-
 static void mp3_player_task(void *pvParameters) {
     HMP3Decoder hMP3Decoder = MP3InitDecoder();
     if (!hMP3Decoder) vTaskDelete(NULL);
@@ -707,9 +767,31 @@ static void mp3_player_task(void *pvParameters) {
 
     int bytes_in_buffer = 0;
     uint8_t *read_ptr = file_buf;
+    bool was_siren_active = false;
 
     while (1) {
-        if (s_track_changed) {
+        bool is_siren_now = s_is_siren_sounding && !s_voice_call_mode;
+
+        if (is_siren_now != was_siren_active) {
+            was_siren_active = is_siren_now;
+            if (f) { fclose(f); f = NULL; }
+            bytes_in_buffer = 0;
+            read_ptr = file_buf;
+
+            if (is_siren_now) {
+                f = fopen(MOUNT_POINT "/emg.mp3", "rb");
+                if (!f) {
+                    ESP_LOGE(TAG, "❌ /sdcard/emg.mp3 파일을 찾을 수 없습니다!");
+                } else {
+                    ESP_LOGW(TAG, "🚨 [EMG 재생 시작] /sdcard/emg.mp3 루프 재생");
+                }
+            } else {
+                current_playing_track = s_target_track;
+                f = open_mp3_track_file(current_playing_track);
+            }
+        }
+
+        if (!is_siren_now && s_track_changed) {
             s_track_changed = false;
             current_playing_track = s_target_track;
             if (f) fclose(f);
@@ -718,17 +800,17 @@ static void mp3_player_task(void *pvParameters) {
             read_ptr = file_buf;
         }
 
-        // 💡 [핵심 수정] portMAX_DELAY를 사용하여 DMA 버퍼 빈자리에 맞춰 실시간 블로킹 전송 (vTaskDelay 제거)
-        if (s_voice_call_mode || !s_music_playing) {
+        // [수정] 음악 정지 상태에서 I2S 무음 버퍼를 언더런 없이 밀어 넣도록 수정
+        if (s_voice_call_mode || (!s_music_playing && !is_siren_now)) {
             if (!s_voice_call_mode) {
                 if (xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                     set_i2s_sample_rate_locked(44100);
                     size_t bytes_written = 0;
-                    i2s_channel_write(s_tx_chan, s_idle_zero_buf, sizeof(s_idle_zero_buf), &bytes_written, portMAX_DELAY);
+                    // 타임아웃 30ms를 주어 DMA 버퍼가 소진되는 타이밍에 딱 맞춰 부드럽게 무음 공급
+                    i2s_channel_write(s_tx_chan, s_idle_zero_buf, sizeof(s_idle_zero_buf), &bytes_written, pdMS_TO_TICKS(30));
                     xSemaphoreGive(s_i2s_mutex);
-                } else {
-                    vTaskDelay(pdMS_TO_TICKS(5));
                 }
+                vTaskDelay(pdMS_TO_TICKS(15));
             } else {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
@@ -740,7 +822,9 @@ static void mp3_player_task(void *pvParameters) {
             int bytes_read = fread(file_buf + bytes_in_buffer, 1, FILE_BUF_SIZE - bytes_in_buffer, f);
             
             if (bytes_read <= 0 && bytes_in_buffer == 0) {
-                if (s_play_mode == 0 || s_play_mode == 1) { 
+                if (is_siren_now) {
+                    rewind(f);
+                } else if (s_play_mode == 0 || s_play_mode == 1) { 
                     int count = (s_total_tracks > 0) ? s_total_tracks : 5;
                     s_target_track = (rand() % count) + 1;
                     s_track_changed = true; 
@@ -780,7 +864,7 @@ static void mp3_player_task(void *pvParameters) {
             int channels = frameInfo.nChans;
 
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (s_music_playing && (now - last_eq_send_time >= 40)) {
+            if (s_music_playing && !is_siren_now && (now - last_eq_send_time >= 40)) {
                 last_eq_send_time = now;
                 int bands[8] = {0};
                 int samples_per_band = sample_count / 8;
@@ -797,8 +881,9 @@ static void mp3_player_task(void *pvParameters) {
                 p4_uart_send_bytes(eq_pkt, pkt_len);
             }
 
+            float cur_vol = is_siren_now ? 0.025f : s_volume_factor;
             for (int i = 0; i < sample_count; i++) {
-                int32_t scaled = (int32_t)(pcm_buf[i] * s_volume_factor);
+                int32_t scaled = (int32_t)(pcm_buf[i] * cur_vol);
                 pcm_buf[i] = (int16_t)(scaled > 32767 ? 32767 : (scaled < -32768 ? -32768 : scaled));
             }
 
@@ -809,7 +894,7 @@ static void mp3_player_task(void *pvParameters) {
 
                     if (channels == 1) {
                         for (int i = 0; i < sample_count; i++) {
-                            stereo_buf[i * 2] = pcm_buf[i];
+                            stereo_buf[i * 2]     = pcm_buf[i];
                             stereo_buf[i * 2 + 1] = pcm_buf[i];
                         }
                         i2s_channel_write(s_tx_chan, stereo_buf, sample_count * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
